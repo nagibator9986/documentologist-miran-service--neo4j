@@ -1,0 +1,27 @@
+# Environment — NEVER commit secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Exports
+/tmp/
+app/tools/fonts/*.ttf
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log

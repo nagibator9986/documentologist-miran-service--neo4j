@@ -1,0 +1,3 @@
+[submodule "bank_knowledge"]
+	path = bank_knowledge
+	url = https://github.com/miraqulum/bank_knowledge

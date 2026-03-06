@@ -1,0 +1,173 @@
+version: "3.9"
+
+services:
+  # ── LangGraph Agent Service ────────────────────────────────────────────────
+  langgraph-agent:
+    build: .
+    container_name: langgraph-agent
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8001}:8001"
+    environment:
+      APP_ENV: ${APP_ENV:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PORT: "8001"
+
+      # CORS — set to your actual frontend origin(s), never use * in production
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
+
+      # Ollama (LLM + Embeddings)
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-mistral:latest}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-bge-m3:latest}
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-120}
+
+      # Qdrant (shared with bank_knowledge)
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-bank_knowledge}
+      QDRANT_TIMEOUT: ${QDRANT_TIMEOUT:-30}
+
+      # Neo4j (shared with bank_knowledge)
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+      NEO4J_MAX_CONNECTION_POOL_SIZE: ${NEO4J_MAX_CONNECTION_POOL_SIZE:-50}
+
+      # Redis
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+
+      # PostgreSQL (agent memory)
+      POSTGRES_DSN: ${POSTGRES_DSN:?POSTGRES_DSN must be set}
+      POSTGRES_TIMEOUT: ${POSTGRES_TIMEOUT:-10}
+
+      # MinIO
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set}
+      MINIO_BUCKET: ${MINIO_BUCKET:-agent-exports}
+      MINIO_SECURE: ${MINIO_SECURE:-false}
+
+      # Export directory (persistent volume)
+      EXPORT_DIR: /exports
+
+      # Tuning
+      MAX_TOKENS_RESPONSE: ${MAX_TOKENS_RESPONSE:-2048}
+      TEMPERATURE: ${TEMPERATURE:-0.1}
+      MIN_RELEVANCE_SCORE: ${MIN_RELEVANCE_SCORE:-0.5}
+
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - agent_exports:/exports
+
+  # ── Qdrant ─────────────────────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      # Bind to 127.0.0.1 so these ports are not exposed on all network interfaces
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ── Neo4j ──────────────────────────────────────────────────────────────────
+  neo4j:
+    image: neo4j:5.20
+    container_name: neo4j
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_memory_heap_maxSize: "1G"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: redis-server --appendonly yes --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ── PostgreSQL (agent long-term memory) ────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: agent_memory
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d agent_memory"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── MinIO (document exports) ────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  qdrant_data:
+  neo4j_data:
+  redis_data:
+  postgres_data:
+  minio_data:
+  agent_exports:

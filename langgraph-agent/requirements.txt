@@ -1,0 +1,43 @@
+# Web framework
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic-settings>=2.2.0
+python-multipart>=0.0.9
+
+# LangGraph + LangChain
+langgraph>=0.1.0
+langchain-core>=0.2.0
+langchain-ollama>=0.2.0
+
+# Vector DB
+qdrant-client>=1.9.0
+
+# Knowledge graph
+neo4j>=5.0.0
+
+# Full-text search
+rank-bm25>=0.2.2
+
+# Cross-encoder reranking (multilingual)
+sentence-transformers>=2.7.0
+
+# Session / cache
+redis>=5.0.0
+
+# Long-term memory (PostgreSQL)
+psycopg2-binary>=2.9.9
+asyncpg>=0.29.0
+
+# Document export
+python-docx>=1.1.0
+fpdf2>=2.7.9
+
+# Object storage
+minio>=7.2.0
+
+# Retry logic
+tenacity>=8.2.0
+
+# Streamlit UI
+streamlit>=1.32.0
+requests>=2.31.0

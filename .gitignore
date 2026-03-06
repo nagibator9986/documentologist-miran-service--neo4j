@@ -1,0 +1,43 @@
+# Secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Jupyter / data
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# Logs & exports
+*.log
+/tmp/
+app/tools/fonts/*.ttf
+
+# Prefect / local data
+.prefect/
+.data/
+.pytest_cache/
+app/uploads/
+
+# Large binary data
+*.pdf
+*.docx
+surya_output.json
