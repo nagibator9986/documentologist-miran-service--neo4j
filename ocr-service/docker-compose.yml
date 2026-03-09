@@ -1,0 +1,176 @@
+version: "3.9"
+
+services:
+  # ── PostgreSQL ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: docolog-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-docolog}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docolog_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-documentolog}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docolog"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - docolog-net
+
+  # ── MinIO (S3-compatible) ───────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: docolog-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - docolog-net
+
+  # ── MinIO bucket init ───────────────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: docolog-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set docminio http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin123};
+      mc mb --ignore-existing docminio/source-files;
+      mc mb --ignore-existing docminio/analysis-results;
+      echo 'Buckets created successfully';
+      "
+    networks:
+      - docolog-net
+
+  # ── Prefect Server ─────────────────────────────────────────
+  prefect-server:
+    image: prefecthq/prefect:3-latest
+    container_name: docolog-prefect
+    restart: unless-stopped
+    command: prefect server start --host 0.0.0.0
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: "postgresql+asyncpg://${POSTGRES_USER:-docolog}:${POSTGRES_PASSWORD:-docolog_secret}@postgres:5432/prefect"
+    ports:
+      - "4200:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - docolog-net
+
+  # ── FastAPI Application ─────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: docolog-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Docker-сеть: переопределяем хосты на имена сервисов (не меняй на localhost)
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-docolog}:${POSTGRES_PASSWORD:-docolog_secret}@postgres:5432/${POSTGRES_DB:-documentolog}"
+      DATABASE_URL_SYNC: "postgresql://${POSTGRES_USER:-docolog}:${POSTGRES_PASSWORD:-docolog_secret}@postgres:5432/${POSTGRES_DB:-documentolog}"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_SECURE: "false"
+      PREFECT_API_URL: "http://prefect-server:4200/api"
+      # Из .env
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-50}
+      OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-300}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:8501"]}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - ./workers:/app/workers
+    networks:
+      - docolog-net
+
+  # ── Prefect Worker (Surya OCR) ──────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: docolog-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Docker-сеть: переопределяем хосты на имена сервисов (не меняй на localhost)
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-docolog}:${POSTGRES_PASSWORD:-docolog_secret}@postgres:5432/${POSTGRES_DB:-documentolog}"
+      DATABASE_URL_SYNC: "postgresql://${POSTGRES_USER:-docolog}:${POSTGRES_PASSWORD:-docolog_secret}@postgres:5432/${POSTGRES_DB:-documentolog}"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_SECURE: "false"
+      PREFECT_API_URL: "http://prefect-server:4200/api"
+      # Из .env
+      OCR_CONCURRENCY_LIMIT: ${OCR_CONCURRENCY_LIMIT:-1}
+      OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-300}
+      OCR_RETRY_DELAY_SECONDS: ${OCR_RETRY_DELAY_SECONDS:-60}
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-50}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./workers:/app/workers
+      - ./app:/app/app
+    networks:
+      - docolog-net
+
+  # ── Streamlit Frontend ──────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: docolog-frontend
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    environment:
+      # Обращаемся к API по имени контейнера во внутренней сети Docker
+      - API_BASE_URL=http://api:8000/api/v1
+    volumes:
+      - ./frontend_app.py:/app/frontend_app.py
+    networks:
+      - docolog-net
+
+volumes:
+  pg_data:
+  minio_data:
+
+networks:
+  docolog-net:
+    driver: bridge

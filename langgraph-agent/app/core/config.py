@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     minio_secret_key: str = "minioadmin"
     minio_bucket: str = "agent-exports"
     minio_secure: bool = False
+    # Public-facing MinIO address for presigned URLs.
+    # Inside Docker the internal endpoint is "minio:9000" (not reachable by browsers).
+    # Set MINIO_PUBLIC_ENDPOINT=localhost:9000 (or your public domain) in .env
+    # so generated presigned URLs are accessible from outside the Docker network.
+    # Falls back to minio_endpoint if not set.
+    minio_public_endpoint: str = ""
 
     # ── Document export ───────────────────────────────────────────────
     # Directory where DOCX/PDF exports are written. Must be writable.
@@ -99,6 +105,11 @@ class Settings(BaseSettings):
     content_snippet_max_len: int = 800
     # Max characters of content shown in citation preview
     citation_preview_max_len: int = 200
+
+    # ── Integration: OCR Service ──────────────────────────────────────
+    # Base URL of the Surya OCR service (first step in the pipeline).
+    # Example: http://ocr-api:8000
+    ocr_service_url: str = "http://localhost:8000"
 
 
 @lru_cache

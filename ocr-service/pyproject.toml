@@ -1,0 +1,13 @@
+[project]
+name = "documentolog"
+version = "0.1.0"
+description = "Документолог: Core — система автоматизированной обработки документов"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

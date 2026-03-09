@@ -37,6 +37,7 @@ class AgentState(TypedDict):
     reranked_docs: list[dict[str, Any]]  # after cross-encoder reranking
 
     # ── Agent outputs ─────────────────────────────────────────────────
+    ingest_result: dict[str, Any]    # {doc_id, status, filename, page_count}
     search_result: str
     verify_result: dict[str, Any]    # {compliant, risk_score, issues, hints}
     generate_result: dict[str, Any]  # {text, export_path}

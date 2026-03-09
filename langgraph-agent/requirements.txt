@@ -38,6 +38,9 @@ minio>=7.2.0
 # Retry logic
 tenacity>=8.2.0
 
+# Rate limiting
+slowapi>=0.1.9
+
 # Streamlit UI
 streamlit>=1.32.0
 requests>=2.31.0

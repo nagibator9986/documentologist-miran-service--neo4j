@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from langchain_core.tools import tool
@@ -20,6 +21,18 @@ _MAX_DEPTH = 5
 # Allowed characters in relationship type names (UPPER_SNAKE_CASE)
 _ALLOWED_REL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ_")
 
+# Lucene special characters that break fulltext queries when unescaped
+_LUCENE_SPECIAL_RE = re.compile(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)')
+
+
+def _escape_lucene(text: str) -> str:
+    """Escape Lucene special characters in fulltext search keywords.
+
+    Prevents query parse errors when user input contains characters like
+    +, -, !, (, ), {, }, [, ], ^, ", ~, *, ?, :, \\, /, &&, ||
+    """
+    return _LUCENE_SPECIAL_RE.sub(r"\\\1", text)
+
 
 @tool
 def neo4j_query(cypher: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
@@ -32,12 +45,16 @@ def neo4j_query(cypher: str, params: dict[str, Any] | None = None) -> list[dict[
     Returns:
         List of result records as dicts.
     """
-    driver = get_neo4j_driver()
-    with driver.session() as session:
-        result = session.run(cypher, parameters=params or {})
-        records = [dict(r) for r in result]
-    logger.debug("neo4j_query → %d records", len(records))
-    return records
+    try:
+        driver = get_neo4j_driver()
+        with driver.session() as session:
+            result = session.run(cypher, parameters=params or {})
+            records = [dict(r) for r in result]
+        logger.debug("neo4j_query → %d records", len(records))
+        return records
+    except Exception as exc:
+        logger.error("neo4j_query failed: %s", exc)
+        return []
 
 
 @tool
@@ -81,6 +98,8 @@ def graph_section_search(keywords: str, limit: int = 5) -> list[dict[str, Any]]:
     with driver.session() as session:
         # Try fulltext index first (created by setup_neo4j.py)
         try:
+            # Escape Lucene special chars to prevent query parse errors
+            safe_kw = _escape_lucene(keywords)
             cypher = f"""
                 CALL db.index.fulltext.queryNodes('{_FULLTEXT_INDEX}', $kw)
                 YIELD node AS s, score
@@ -96,7 +115,7 @@ def graph_section_search(keywords: str, limit: int = 5) -> list[dict[str, Any]]:
                 ORDER BY score DESC
                 LIMIT $limit
             """
-            result = session.run(cypher, kw=keywords, limit=limit)
+            result = session.run(cypher, kw=safe_kw, limit=limit)
             records = [dict(r) for r in result]
             if records:
                 logger.debug("graph_section_search (fulltext) → %d records", len(records))

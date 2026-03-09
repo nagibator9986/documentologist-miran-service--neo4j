@@ -7,16 +7,21 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from .api.v1.chat import router as chat_router
 from .api.v1.documents import router as documents_router
+from .api.v1.ingest import router as ingest_router
 from .api.v1.sessions import router as sessions_router
 from .core.config import get_settings
-from .core.utils import close_all_clients
-from .tools.session_memory import pg_ensure_schema_sync
+from .core.rate_limit import limiter
+from .core.utils import close_all_clients, ensure_neo4j_fulltext_index
+from .tools.session_memory import pg_ensure_schema_sync, pg_shutdown
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -45,11 +50,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Ensure PostgreSQL schema exists (non-fatal: agent still works without PG)
     pg_ensure_schema_sync()
 
+    # Ensure Neo4j fulltext index exists (non-fatal: graph search falls back to CONTAINS)
+    ensure_neo4j_fulltext_index()
+
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────
     logger.info("LangGraph Agent shutting down — closing DB connections…")
     close_all_clients()
+    await pg_shutdown()
     logger.info("Shutdown complete.")
 
 
@@ -69,6 +78,11 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # ── Rate limiting ─────────────────────────────────────────────────
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+
     # ── CORS ─────────────────────────────────────────────────────────
     # Configured via CORS_ORIGINS env var. Never use ["*"] in production.
     app.add_middleware(
@@ -82,6 +96,7 @@ def create_app() -> FastAPI:
     # ── Routers ──────────────────────────────────────────────────────
     app.include_router(chat_router, prefix="/api/v1")
     app.include_router(documents_router, prefix="/api/v1")
+    app.include_router(ingest_router, prefix="/api/v1")
     app.include_router(sessions_router, prefix="/api/v1")
 
     # ── System endpoints ─────────────────────────────────────────────

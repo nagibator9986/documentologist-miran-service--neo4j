@@ -47,23 +47,34 @@ def _fetch_document_content(state: AgentState, query: str) -> str:
     """
     s = get_settings()
 
-    # 1. Explicit document IDs
+    # 1. Explicit document IDs — filter Qdrant by payload meta_json field.
+    # NOTE: document_ids are OCR doc UUIDs (PostgreSQL), NOT Qdrant point UUIDs.
+    # client.retrieve() expects Qdrant point IDs — must use scroll with payload filter instead.
     doc_ids = state.get("document_ids") or []
     if doc_ids:
         from ..core.utils import get_qdrant_client
+        from qdrant_client import models as qmodels
         client = get_qdrant_client()
         try:
-            results = client.retrieve(
-                collection_name=s.qdrant_collection,
-                ids=doc_ids,
-                with_payload=True,
-            )
             chunks = []
-            for r in results:
-                payload = r.payload or {}
-                text = payload.get("answer") or payload.get("text", "")
-                if text:
-                    chunks.append(text[:s.content_snippet_max_len])
+            for doc_id in doc_ids[:3]:  # limit to 3 docs to avoid context overflow
+                records, _ = client.scroll(
+                    collection_name=s.qdrant_collection,
+                    scroll_filter=qmodels.Filter(
+                        must=[qmodels.FieldCondition(
+                            key="meta_json",
+                            match=qmodels.MatchText(text=doc_id),
+                        )]
+                    ),
+                    limit=10,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for r in records:
+                    payload = r.payload or {}
+                    text = payload.get("answer") or payload.get("text", "")
+                    if text:
+                        chunks.append(text[:s.content_snippet_max_len])
             if chunks:
                 logger.info("verify_node: fetched %d chunks for document_ids=%s", len(chunks), doc_ids)
                 return "\n\n".join(chunks)

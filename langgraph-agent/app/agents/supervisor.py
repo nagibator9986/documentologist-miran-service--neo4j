@@ -24,13 +24,15 @@ verify   - check compliance, find violations, assess legal risk
            Examples: "проверь на соответствие", "есть ли нарушения", "оцени риски"
 generate - create a new document (contract, report, letter)
            Examples: "составь договор", "создай отчёт", "напиши письмо", "сгенерируй"
+ingest   - upload document, check processing status, manage indexed files
+           Examples: "загрузи документ", "статус обработки", "добавь файл", "проиндексируй", "какие документы загружены"
 
 If TWO different operations are needed, output both separated by comma, e.g.: search,verify
 
 Output ONLY the intent word(s), nothing else."""
 
-Intent = Literal["search", "verify", "generate", "analyze"]
-_VALID_INTENTS = {"search", "verify", "generate", "analyze"}
+Intent = Literal["ingest", "search", "verify", "generate", "analyze"]
+_VALID_INTENTS = {"ingest", "search", "verify", "generate", "analyze"}
 
 # Compound patterns (checked BEFORE single-intent classification).
 # Format: (regex, primary_intent, secondary_intent)
@@ -62,6 +64,12 @@ _VERIFY_KW = re.compile(
     r"оцени\s+риски|риск[ио]вый\s+анализ)\b",
     re.IGNORECASE | re.UNICODE,
 )
+_INGEST_KW = re.compile(
+    r"\b(загруз|загрузить|добавь|добавить|обработай|проиндексируй|прикреп|"
+    r"статус\s+обработки|статус\s+документ|какие\s+документ|список\s+документ|"
+    r"новый\s+документ|загруженн)",
+    re.IGNORECASE | re.UNICODE,
+)
 _SEARCH_KW = re.compile(
     r"\b(что\s+такое|что\s+это\s+такое|расскажи\s+про|расскажи\s+о|"
     r"объясни|как\s+работает|какие\s+права|какова\s+процедура|"
@@ -73,6 +81,8 @@ _SEARCH_KW = re.compile(
 def _keyword_classify(query: str) -> str | None:
     """Return a high-confidence single intent from keywords, or None if ambiguous."""
     q = query
+    if _INGEST_KW.search(q):
+        return "ingest"
     if _ANALYZE_KW.search(q):
         return "analyze"
     if _GENERATE_KW.search(q):
@@ -85,19 +95,12 @@ def _keyword_classify(query: str) -> str | None:
 
 
 def _detect_intents_from_llm(query: str, llm_raw: str) -> list[str]:
-    """Parse LLM output and apply heuristic multi-intent detection."""
+    """Parse LLM output and extract up to 2 valid intents, preserving order."""
     words = re.findall(r"[a-z]+", llm_raw.lower())
-    parsed = [w for w in words if w in _VALID_INTENTS]
-
+    # dict.fromkeys deduplicates while preserving insertion order (no extra loop needed)
+    parsed = list(dict.fromkeys(w for w in words if w in _VALID_INTENTS))
     if len(parsed) >= 2:
-        seen: set[str] = set()
-        intents: list[str] = []
-        for p in parsed:
-            if p not in seen:
-                seen.add(p)
-                intents.append(p)
-        return intents[:2]
-
+        return parsed[:2]
     return [parsed[0] if parsed else "search"]
 
 

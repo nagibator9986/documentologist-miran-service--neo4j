@@ -1,0 +1,13 @@
+-r base.txt
+
+# Убираем жесткий пин transformers, даем pip выбрать (между 4.51 и 4.54)
+surya-ocr==0.16.0
+
+# Стабильные версии Torch для CPU
+torch>=2.2.0 --extra-index-url https://download.pytorch.org/whl/cpu
+torchvision>=0.17.0 --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Остальные зависимости
+pdf2image
+Pillow
+pymupdf

@@ -1,0 +1,4 @@
+-r api.txt
+
+pytest>=8.0,<9
+httpx>=0.27,<1

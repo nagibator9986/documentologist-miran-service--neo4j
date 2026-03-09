@@ -1,0 +1,9 @@
+-r base.txt
+
+# ── FastAPI ──────────────────────────────
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+python-multipart>=0.0.7,<1
+
+# ── Observability ─────────────────────────
+prometheus-client>=0.20,<1

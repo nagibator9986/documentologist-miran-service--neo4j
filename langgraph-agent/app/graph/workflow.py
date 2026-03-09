@@ -22,6 +22,7 @@ from langgraph.graph import END, START, StateGraph
 
 from ..agents.analyze_agent import analyze_node
 from ..agents.generate_agent import generate_node
+from ..agents.ingest_agent import ingest_node
 from ..agents.memory_agent import memory_load_node, memory_save_node
 from ..agents.search_agent import search_node
 from ..agents.supervisor import classify_intent, route_intent
@@ -30,7 +31,7 @@ from .state import AgentState
 
 logger = logging.getLogger(__name__)
 
-_AGENT_NODES = ("search", "verify", "generate", "analyze")
+_AGENT_NODES = ("ingest", "search", "verify", "generate", "analyze")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -105,6 +106,7 @@ def build_graph() -> StateGraph:
     # ── Nodes ─────────────────────────────────────────────────────────────────
     builder.add_node("memory_load",    memory_load_node)
     builder.add_node("supervisor",     classify_intent)
+    builder.add_node("ingest",         ingest_node)
     builder.add_node("search",         search_node)
     builder.add_node("verify",         verify_node)
     builder.add_node("generate",       generate_node)

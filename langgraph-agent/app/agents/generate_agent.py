@@ -24,22 +24,41 @@ logger = logging.getLogger(__name__)
 
 
 def _minio_upload(local_path: str, object_name: str) -> str | None:
-    """Upload a local file to MinIO and return the object URL. Non-fatal."""
+    """Upload a local file to MinIO and return a presigned download URL. Non-fatal.
+
+    Upload uses the internal MINIO_ENDPOINT (works inside Docker network).
+    The presigned URL is generated using MINIO_PUBLIC_ENDPOINT (falls back to
+    MINIO_ENDPOINT) so external clients can actually reach the download link.
+    """
     try:
+        from datetime import timedelta
         from minio import Minio
         from ..core.config import get_settings as _gs
         s = _gs()
-        client = Minio(
+
+        # Upload via internal Docker address
+        upload_client = Minio(
             s.minio_endpoint,
             access_key=s.minio_access_key,
             secret_key=s.minio_secret_key,
             secure=s.minio_secure,
         )
-        if not client.bucket_exists(s.minio_bucket):
-            client.make_bucket(s.minio_bucket)
-        client.fput_object(s.minio_bucket, object_name, local_path)
-        scheme = "https" if s.minio_secure else "http"
-        return f"{scheme}://{s.minio_endpoint}/{s.minio_bucket}/{object_name}"
+        if not upload_client.bucket_exists(s.minio_bucket):
+            upload_client.make_bucket(s.minio_bucket)
+        upload_client.fput_object(s.minio_bucket, object_name, local_path)
+
+        # Presigned URL via public endpoint (accessible from outside Docker)
+        public_endpoint = s.minio_public_endpoint or s.minio_endpoint
+        url_client = Minio(
+            public_endpoint,
+            access_key=s.minio_access_key,
+            secret_key=s.minio_secret_key,
+            secure=s.minio_secure,
+        )
+        url = url_client.presigned_get_object(
+            s.minio_bucket, object_name, expires=timedelta(days=7)
+        )
+        return url
     except Exception as exc:
         logger.warning("MinIO upload failed (non-critical): %s", exc)
         return None

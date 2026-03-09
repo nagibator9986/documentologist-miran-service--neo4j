@@ -51,13 +51,20 @@ def sigmoid_score(raw: float) -> float:
 # ---------------------------------------------------------------------------
 
 
-def safe_parse_json(raw: str, fallback: dict[str, Any]) -> dict[str, Any]:
+def safe_parse_json(raw: str | None, fallback: dict[str, Any]) -> dict[str, Any]:
     """Extract the first valid JSON object from LLM output.
 
     Uses brace-counting (not rfind) so nested objects are handled correctly.
-    Falls back to `fallback` on any parse error.
+    Falls back to `fallback` on any parse error or if `raw` is None / non-string.
     """
     import json
+
+    if not isinstance(raw, str) or not raw:
+        logger.warning(
+            "safe_parse_json: received %s instead of str — using fallback",
+            type(raw).__name__,
+        )
+        return dict(fallback)
 
     text = raw.strip()
 
@@ -203,3 +210,64 @@ def close_all_clients() -> None:
                 logger.warning("Error closing Neo4j driver: %s", exc)
             finally:
                 _neo4j_driver = None
+
+
+# ---------------------------------------------------------------------------
+# Neo4j index bootstrap
+# ---------------------------------------------------------------------------
+
+_FULLTEXT_INDEX = "sectionText"
+
+
+def ensure_neo4j_fulltext_index() -> None:
+    """Create Neo4j fulltext index + B-tree property indexes on startup.
+
+    Indexes created (all IF NOT EXISTS — safe to call repeatedly):
+    - Fulltext: Section.text_preview  (for graph_section_search)
+    - B-tree:   Document(doc_id), Section(section_id) — primary keys for MERGE
+    - B-tree:   Entity(text), Entity(label)            — for graph_entity_lookup
+    - B-tree:   Obligation(subject)                    — for graph_obligation_search
+    - B-tree:   Law(law_id), Law(title)                — for law_lookup / law queries
+
+    Non-fatal: if Neo4j is unreachable at startup the agent still works;
+    CONTAINS fallback is used for fulltext, B-tree lookups degrade to full scans.
+    """
+    _BTREE_INDEXES = [
+        ("doc_doc_id",        "FOR (d:Document)   ON (d.doc_id)"),
+        ("sec_section_id",    "FOR (s:Section)    ON (s.section_id)"),
+        ("ent_text",          "FOR (e:Entity)     ON (e.text)"),
+        ("ent_label",         "FOR (e:Entity)     ON (e.label)"),
+        ("obl_subject",       "FOR (o:Obligation) ON (o.subject)"),
+        ("law_law_id",        "FOR (l:Law)        ON (l.law_id)"),
+        ("law_title",         "FOR (l:Law)        ON (l.title)"),
+    ]
+    try:
+        driver = get_neo4j_driver()
+        with driver.session() as session:
+            # ── Fulltext index ────────────────────────────────────────────────
+            result = session.run(
+                "SHOW INDEXES WHERE name = $name",
+                name=_FULLTEXT_INDEX,
+            )
+            if result.single():
+                logger.debug("Neo4j fulltext index '%s' already exists.", _FULLTEXT_INDEX)
+            else:
+                session.run(
+                    f"CREATE FULLTEXT INDEX {_FULLTEXT_INDEX} IF NOT EXISTS "
+                    f"FOR (s:Section) ON EACH [s.text_preview]"
+                )
+                logger.info("Neo4j fulltext index '%s' created.", _FULLTEXT_INDEX)
+
+            # ── B-tree property indexes ───────────────────────────────────────
+            existing_idx = {r["name"] for r in session.run("SHOW INDEXES YIELD name")}
+            for idx_name, idx_clause in _BTREE_INDEXES:
+                if idx_name in existing_idx:
+                    logger.debug("Neo4j index '%s' already exists.", idx_name)
+                    continue
+                session.run(f"CREATE INDEX {idx_name} IF NOT EXISTS {idx_clause}")
+                logger.info("Neo4j index '%s' created.", idx_name)
+
+    except Exception as exc:
+        logger.warning(
+            "ensure_neo4j_fulltext_index failed (non-critical — CONTAINS fallback active): %s", exc
+        )

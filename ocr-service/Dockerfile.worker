@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# System deps for PDF/image processing
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev gcc curl poppler-utils libgl1 libglib2.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements/base.txt requirements/base.txt
+COPY requirements/worker.txt requirements/worker.txt
+RUN pip install --no-cache-dir -r requirements/worker.txt
+
+COPY app/ app/
+COPY workers/ workers/
+
+CMD ["python", "-m", "workers.main"]

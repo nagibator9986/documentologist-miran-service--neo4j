@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -21,6 +22,7 @@ from ..core.utils import build_history_messages
 from ..graph.state import AgentState
 from ..tools.bm25_search import bm25_search
 from ..tools.neo4j_query import (
+    graph_entity_lookup,
     graph_obligation_search,
     graph_section_search,
     neo4j_query,
@@ -29,6 +31,24 @@ from ..tools.qdrant_search import qdrant_search, qdrant_text_search
 from ..tools.reranker import reranker
 
 _ARTICLE_NUM_RE = re.compile(r"[Сс]тать[яей]\s+(\d+)", re.UNICODE)
+
+# Entity query detection: legal entity prefixes or 2+ consecutive capitalized words
+_ENTITY_ORG_RE = re.compile(
+    r'\b(ТОО|АО|НАО|ОАО|ЗАО|ГП|ЧП|МФО|БВУ|Kaspi|Halyk|БТА|Цесна|Jusan|Нурбанк|Евразийский|Bereke)\b',
+    re.UNICODE,
+)
+_CAPS_SEQUENCE_RE = re.compile(
+    r'\b[А-ЯЁ][а-яё]{2,}(?:\s+[А-ЯЁ][а-яё]{2,}){1,}\b',
+    re.UNICODE,
+)
+
+# Law name detection in queries — to trigger a Law node search
+_LAW_QUERY_RE = re.compile(
+    r'(?:Закон\s+(?:РК|Республики\s+Казахстан)\s+о[б]?\s+[а-яёА-ЯЁ][а-яё\s,]{4,50}'
+    r'|(?:Гражданский|Налоговый|Трудовой|Уголовный)\s+кодекс'
+    r'|(?:ГК|НК|ТК|КоАП|УК)\s+(?:РК|Республики\s+Казахстан))',
+    re.IGNORECASE | re.UNICODE,
+)
 
 _OBL_KEYWORDS = frozenset([
     "обяза", "должен", "обязан", "ответствен", "вправе", "право ",
@@ -246,23 +266,106 @@ def search_node(state: AgentState) -> AgentState:
             seen_ids.add(hit_id)
             merged.append(hit)
 
-    # ── 4. Graph enrichment ───────────────────────────────────────────────────
+    # ── 4. Graph enrichment — parallel execution ──────────────────────────────
+    # section search, article lookup, obligation search, entity lookup, law search
+    # all run concurrently in threads.
+    kw = _extract_graph_keywords(query, s.graph_kw_max_words)
+    art_match = _ARTICLE_NUM_RE.search(query)
+    needs_obligations = any(ob_kw in query.lower() for ob_kw in _OBL_KEYWORDS)
+    needs_entities = bool(_ENTITY_ORG_RE.search(query) or _CAPS_SEQUENCE_RE.search(query))
+    law_match = _LAW_QUERY_RE.search(query)
+
+    def _graph_sections() -> list[dict]:
+        return graph_section_search.invoke({"keywords": kw, "limit": 4})
+
+    def _graph_articles() -> list[dict]:
+        if not art_match:
+            return []
+        return neo4j_query.invoke({
+            "cypher": (
+                "MATCH (a:Article {number: $num})<-[:HAS_ARTICLE]-(s:Section)"
+                "<-[:CONTAINS]-(d:Document) "
+                "RETURN a.number AS number, a.title AS title, "
+                "s.text_preview AS text, d.filename AS source LIMIT 3"
+            ),
+            "params": {"num": int(art_match.group(1))},
+        })
+
+    def _graph_obligations() -> list[dict]:
+        if not needs_obligations:
+            return []
+        return graph_obligation_search.invoke({
+            "keywords": kw,
+            "limit": 3,
+        })
+
+    def _graph_entities() -> list[dict]:
+        if not needs_entities:
+            return []
+        return graph_entity_lookup.invoke({"text": kw[:60], "limit": 4})
+
+    def _graph_law_search() -> list[dict]:
+        if not law_match:
+            return []
+        law_text = law_match.group(0)[:80]
+        return neo4j_query.invoke({
+            "cypher": (
+                "MATCH (l:Law) "
+                "WHERE toLower(l.title) CONTAINS toLower($kw) "
+                "OPTIONAL MATCH (l)-[:HAS_ARTICLE]->(a:Article) "
+                "RETURN l.law_id AS law_id, l.title AS title, "
+                "collect({number: a.number, title: a.title}) AS articles "
+                "LIMIT 3"
+            ),
+            "params": {"kw": law_text},
+        })
+
+    raw_sections: list[dict] = []
+    art_records: list[dict] = []
+    obl_records: list[dict] = []
+    ent_records: list[dict] = []
+    law_records: list[dict] = []
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            pool.submit(_graph_sections): "sections",
+            pool.submit(_graph_articles): "articles",
+            pool.submit(_graph_obligations): "obligations",
+            pool.submit(_graph_entities): "entities",
+            pool.submit(_graph_law_search): "laws",
+        }
+        try:
+            for future in as_completed(futures, timeout=8):
+                label = futures[future]
+                try:
+                    result = future.result()
+                    if label == "sections":
+                        raw_sections = result
+                    elif label == "articles":
+                        art_records = result
+                    elif label == "obligations":
+                        obl_records = result
+                    elif label == "entities":
+                        ent_records = result
+                    else:
+                        law_records = result
+                except Exception as exc:
+                    logger.warning("Graph %s lookup failed: %s", label, exc)
+        except TimeoutError:
+            # Some graph queries exceeded 8s — use whatever results arrived so far
+            logger.warning("search_node: graph enrichment timeout (8s) — using partial results")
+
     graph_hits: list[dict] = []
-    try:
-        kw = _extract_graph_keywords(query, s.graph_kw_max_words)
-        raw_sections = graph_section_search.invoke({"keywords": kw, "limit": 4})
-        for sec in raw_sections:
-            text = sec.get("text") or ""
-            if text:
-                graph_hits.append({
-                    "id": sec.get("section_id", ""),
-                    "content": text[:s.content_snippet_max_len],
-                    "score": float(sec.get("score", 0.0)),
-                    "section": f"стр. {sec.get('page', '?')} — {sec.get('source', '')}",
-                    "metadata": {"articles": sec.get("articles", [])},
-                })
-    except Exception as exc:
-        logger.warning("Graph section search failed: %s", exc)
+    for sec in raw_sections:
+        text = sec.get("text") or ""
+        if text:
+            graph_hits.append({
+                "id": sec.get("section_id", ""),
+                "content": text[:s.content_snippet_max_len],
+                "score": float(sec.get("score", 0.0)),
+                "section": f"стр. {sec.get('page', '?')} — {sec.get('source', '')}",
+                "metadata": {"articles": sec.get("articles", [])},
+            })
 
     # ── 5. Filter by minimum cosine score ────────────────────────────────────
     relevant_qdrant = [h for h in merged if h.get("score", 0) >= s.min_relevance_score]
@@ -274,77 +377,102 @@ def search_node(state: AgentState) -> AgentState:
         relevant_qdrant = merged
 
     # ── 5b. Merge graph hits (bypass cosine filter) ───────────────────────────
-    seen_ids_2: set[str] = set()
-    for idx, h in enumerate(relevant_qdrant):
-        raw_id = h.get("id")
-        seen_ids_2.add(str(raw_id) if raw_id else f"idx:{idx}:{hash(h.get('content', ''))}")
+    # Reuse seen_ids from step 3 — no need to rebuild a second set from scratch.
     for gh in graph_hits:
         raw_id = gh.get("id")
         gh_id = str(raw_id) if raw_id else f"graph:{hash(gh.get('content', ''))}"
-        if gh_id not in seen_ids_2:
-            seen_ids_2.add(gh_id)
+        if gh_id not in seen_ids:
+            seen_ids.add(gh_id)
             relevant_qdrant.append(gh)
 
-    # ── 5c. Article number auto-lookup ───────────────────────────────────────
-    if art_match := _ARTICLE_NUM_RE.search(query):
-        try:
-            art_num = int(art_match.group(1))
-            art_records = neo4j_query.invoke({
-                "cypher": (
-                    "MATCH (a:Article {number: $num})<-[:HAS_ARTICLE]-(s:Section)"
-                    "<-[:CONTAINS]-(d:Document) "
-                    "RETURN a.number AS number, a.title AS title, "
-                    "s.text_preview AS text, d.filename AS source LIMIT 3"
-                ),
-                "params": {"num": art_num},
-            })
-            for rec in art_records:
-                if rec.get("text"):
-                    art_id = f"article:{art_num}:{rec.get('source', '')}"
-                    if art_id not in seen_ids_2:
-                        seen_ids_2.add(art_id)
-                        title_part = f": {rec['title']}" if rec.get("title") else ""
-                        relevant_qdrant.append({
-                            "id": art_id,
-                            "content": (
-                                f"Статья {art_num}{title_part}\n"
-                                f"{rec.get('text', '')[:s.content_snippet_max_len]}"
-                            ),
-                            "score": 1.0,
-                            "section": rec.get("source", ""),
-                            "metadata": {
-                                "article_number": art_num,
-                                "article_title": rec.get("title", ""),
-                            },
-                        })
-        except Exception as exc:
-            logger.warning("Article auto-lookup failed: %s", exc)
-
-    # ── 5d. Obligation search ─────────────────────────────────────────────────
-    if any(kw in query.lower() for kw in _OBL_KEYWORDS):
-        try:
-            obl_records = graph_obligation_search.invoke({
-                "keywords": _extract_graph_keywords(query, s.graph_kw_max_words),
-                "limit": 3,
-            })
-            for rec in obl_records:
-                content = " — ".join(
-                    p for p in [rec.get("subject"), rec.get("action"), rec.get("object")] if p
-                )
-                if rec.get("evidence"):
-                    content += f"\n{rec['evidence']}"
-                obl_id = f"obl:{rec.get('doc_id', '')}:{hash(content)}"
-                if obl_id not in seen_ids_2:
-                    seen_ids_2.add(obl_id)
+    # ── 5c. Merge article results ─────────────────────────────────────────────
+    if art_match:
+        art_num = int(art_match.group(1))
+        for rec in art_records:
+            if rec.get("text"):
+                art_id = f"article:{art_num}:{rec.get('source', '')}"
+                if art_id not in seen_ids:
+                    seen_ids.add(art_id)
+                    title_part = f": {rec['title']}" if rec.get("title") else ""
                     relevant_qdrant.append({
-                        "id": obl_id,
-                        "content": content[:s.content_snippet_max_len],
-                        "score": float(rec.get("confidence", 0.7)),
-                        "section": rec.get("document", ""),
-                        "metadata": {"type": "obligation", "deadline": rec.get("deadline", "")},
+                        "id": art_id,
+                        "content": (
+                            f"Статья {art_num}{title_part}\n"
+                            f"{rec.get('text', '')[:s.content_snippet_max_len]}"
+                        ),
+                        "score": 1.0,
+                        "section": rec.get("source", ""),
+                        "metadata": {
+                            "article_number": art_num,
+                            "article_title": rec.get("title", ""),
+                        },
                     })
-        except Exception as exc:
-            logger.warning("Obligation search failed: %s", exc)
+
+    # ── 5d. Merge obligation results ──────────────────────────────────────────
+    for rec in obl_records:
+        content = " — ".join(
+            p for p in [rec.get("subject"), rec.get("action"), rec.get("object")] if p
+        )
+        if rec.get("evidence"):
+            content += f"\n{rec['evidence']}"
+        obl_id = f"obl:{rec.get('doc_id', '')}:{hash(content)}"
+        if obl_id not in seen_ids:
+            seen_ids.add(obl_id)
+            relevant_qdrant.append({
+                "id": obl_id,
+                "content": content[:s.content_snippet_max_len],
+                "score": float(rec.get("confidence", 0.7)),
+                "section": rec.get("document", ""),
+                "metadata": {"type": "obligation", "deadline": rec.get("deadline", "")},
+            })
+
+    # ── 5e. Merge entity results ──────────────────────────────────────────────
+    for rec in ent_records:
+        ent_text = rec.get("text", "")
+        ent_label = rec.get("label", "")
+        if not ent_text:
+            continue
+        content_parts = [f"{ent_label}: {ent_text}"]
+        if rec.get("role"):
+            content_parts.append(f"Роль: {rec['role']}")
+        if rec.get("evidence"):
+            content_parts.append(rec["evidence"])
+        content = "\n".join(content_parts)
+        docs = rec.get("documents") or []
+        ent_id = f"ent:{ent_label}:{ent_text}"
+        if ent_id not in seen_ids:
+            seen_ids.add(ent_id)
+            relevant_qdrant.append({
+                "id": ent_id,
+                "content": content[:s.content_snippet_max_len],
+                "score": float(rec.get("confidence", 0.6)),
+                "section": ", ".join(docs[:2]) if docs else "",
+                "metadata": {"type": "entity", "entity_label": ent_label, "entity_text": ent_text},
+            })
+
+    # ── 5f. Merge law search results ──────────────────────────────────────────
+    for rec in law_records:
+        law_title = rec.get("title", "")
+        if not law_title:
+            continue
+        articles = rec.get("articles") or []
+        art_list = ", ".join(
+            f"ст.{a.get('number', '')}{': ' + a['title'] if a.get('title') else ''}"
+            for a in articles[:10] if a.get("number")
+        )
+        content = f"Закон: {law_title}"
+        if art_list:
+            content += f"\nСтатьи: {art_list}"
+        law_id = f"law:{rec.get('law_id', law_title)}"
+        if law_id not in seen_ids:
+            seen_ids.add(law_id)
+            relevant_qdrant.append({
+                "id": law_id,
+                "content": content[:s.content_snippet_max_len],
+                "score": 1.0,
+                "section": law_title,
+                "metadata": {"type": "law", "law_id": rec.get("law_id", "")},
+            })
 
     relevant = relevant_qdrant
 
@@ -443,6 +571,8 @@ def search_node(state: AgentState) -> AgentState:
         "vector_hits": len(vector_hits),
         "bm25_hits": len(bm25_hits),
         "graph_hits": len(graph_hits),
+        "entity_hits": len(ent_records),
+        "law_hits": len(law_records),
         "merged_hits": len(merged),
         "relevant_hits": len(relevant),
         "reranked_hits": len(reranked),

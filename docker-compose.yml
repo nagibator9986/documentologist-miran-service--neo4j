@@ -1,0 +1,356 @@
+version: "3.9"
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Miran Service — unified docker-compose
+#
+# Full pipeline:
+#   OCR Service (8000) → bank-knowledge indexer (8002) → langgraph-agent (8001)
+#
+# Shared infrastructure:
+#   PostgreSQL (multi-DB) · MinIO · Redis · Qdrant · Neo4j · Prefect · Ollama
+#
+# Usage:
+#   cp .env.example .env && docker compose up -d
+# ════════════════════════════════════════════════════════════════════════════════
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # INFRASTRUCTURE
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: miran-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-miran}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-miran}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  minio:
+    image: minio/minio:latest
+    container_name: miran-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: miran-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set miran http://minio:9000 $${MINIO_ACCESS_KEY} $${MINIO_SECRET_KEY};
+      mc mb --ignore-existing miran/source-files;
+      mc mb --ignore-existing miran/analysis-results;
+      mc mb --ignore-existing miran/agent-exports;
+      echo 'MinIO buckets ready';
+      "
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    networks:
+      - miran-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: miran-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --loglevel warning
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: miran-qdrant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  neo4j:
+    image: neo4j:5.20
+    container_name: miran-neo4j
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_memory_heap_maxSize: "1G"
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  prefect-server:
+    image: prefecthq/prefect:3-latest
+    container_name: miran-prefect
+    restart: unless-stopped
+    command: prefect server start --host 0.0.0.0
+    environment:
+      PREFECT_API_DATABASE_CONNECTION_URL: "postgresql+asyncpg://${POSTGRES_USER:-miran}:${POSTGRES_PASSWORD}@postgres:5432/prefect"
+    ports:
+      - "127.0.0.1:4200:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # APPLICATION SERVICES
+  # ─────────────────────────────────────────────────────────────────────────────
+
+  # Step 1: OCR Service — Surya OCR via Prefect
+  ocr-api:
+    build:
+      context: ./ocr-service
+      dockerfile: Dockerfile.api
+    container_name: miran-ocr-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-miran}:${POSTGRES_PASSWORD}@postgres:5432/ocr_service"
+      DATABASE_URL_SYNC: "postgresql://${POSTGRES_USER:-miran}:${POSTGRES_PASSWORD}@postgres:5432/ocr_service"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_SECURE: "false"
+      PREFECT_API_URL: "http://prefect-server:4200/api"
+      MAX_UPLOAD_SIZE_MB: ${MAX_UPLOAD_SIZE_MB:-50}
+      OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-300}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
+      INDEXER_WEBHOOK_URL: "http://bank-knowledge:8002/api/v1/index"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      prefect-server:
+        condition: service_started
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  ocr-worker:
+    build:
+      context: ./ocr-service
+      dockerfile: Dockerfile.worker
+    container_name: miran-ocr-worker
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-miran}:${POSTGRES_PASSWORD}@postgres:5432/ocr_service"
+      DATABASE_URL_SYNC: "postgresql://${POSTGRES_USER:-miran}:${POSTGRES_PASSWORD}@postgres:5432/ocr_service"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_SECURE: "false"
+      PREFECT_API_URL: "http://prefect-server:4200/api"
+      OCR_CONCURRENCY_LIMIT: ${OCR_CONCURRENCY_LIMIT:-1}
+      OCR_TIMEOUT_SECONDS: ${OCR_TIMEOUT_SECONDS:-300}
+      OCR_RETRY_DELAY_SECONDS: ${OCR_RETRY_DELAY_SECONDS:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      INDEXER_WEBHOOK_URL: "http://bank-knowledge:8002/api/v1/index"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      prefect-server:
+        condition: service_started
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  # Step 2: bank_knowledge Indexer — chunk → embed → Qdrant + Neo4j
+  bank-knowledge:
+    build:
+      context: ./bank_knowledge
+      dockerfile: Dockerfile.indexer
+    container_name: miran-bank-knowledge
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8002:8002"
+    environment:
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_SECURE: "false"
+      BUCKET_RESULTS: "analysis-results"
+      QDRANT_URL: "http://qdrant:6333"
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-bank_knowledge}
+      QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-1024}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-bge-m3:latest}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+      REDIS_URL: "redis://redis:6379"
+      CHUNK_MAX_CHARS: ${CHUNK_MAX_CHARS:-2000}
+      CHUNK_OVERLAP_CHARS: ${CHUNK_OVERLAP_CHARS:-200}
+      CHUNK_MIN_CHARS: ${CHUNK_MIN_CHARS:-100}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  # Step 3: LangGraph Agent — multi-agent RAG
+  langgraph-agent:
+    build:
+      context: ./langgraph-agent
+      dockerfile: Dockerfile
+    container_name: miran-langgraph-agent
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8001}:8001"
+    environment:
+      APP_ENV: ${APP_ENV:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PORT: "8001"
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
+
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-mistral:latest}
+      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-bge-m3:latest}
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-120}
+
+      QDRANT_URL: "http://qdrant:6333"
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-bank_knowledge}
+
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD}
+
+      REDIS_URL: "redis://redis:6379"
+
+      POSTGRES_DSN: "postgresql://${POSTGRES_USER:-miran}:${POSTGRES_PASSWORD}@postgres:5432/agent_memory"
+
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: "agent-exports"
+      MINIO_SECURE: "false"
+      # Public MinIO URL for presigned download links (browser-accessible).
+      # Set to your host IP or domain, e.g. "localhost:9000" or "minio.example.com"
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-localhost:9000}
+
+      OCR_SERVICE_URL: "http://ocr-api:8000"
+
+      EXPORT_DIR: /exports
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      bank-knowledge:
+        condition: service_started
+      ocr-api:
+        condition: service_started
+    volumes:
+      - agent_exports:/exports
+    networks:
+      - miran-net
+    logging: *default-logging
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOLUMES & NETWORK
+# ─────────────────────────────────────────────────────────────────────────────
+
+volumes:
+  postgres_data:
+  minio_data:
+  redis_data:
+  qdrant_data:
+  neo4j_data:
+  agent_exports:
+
+networks:
+  miran-net:
+    driver: bridge

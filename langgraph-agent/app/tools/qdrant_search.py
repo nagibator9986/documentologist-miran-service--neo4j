@@ -166,9 +166,18 @@ def qdrant_text_search(
         return found[:limit]
 
     # ── Strategy 2: Python-side full-scan fallback ────────────────────────────
-    logger.debug("qdrant_text_search: server filter empty, falling back to full scan")
+    # Hard cap: scan at most _MAX_SCAN_BATCHES × 200 chunks (= 10 000 max).
+    # Prevents unbounded O(n) scans on large collections if server-side filter
+    # is unavailable (e.g. index not created yet).
+    _MAX_SCAN_BATCHES = 50
+    logger.warning(
+        "qdrant_text_search: server filter returned nothing, falling back to full scan "
+        "(capped at %d batches × 200 = %d chunks)",
+        _MAX_SCAN_BATCHES, _MAX_SCAN_BATCHES * 200,
+    )
     pg_offset = None
-    while len(found) < limit:
+    batches_done = 0
+    while len(found) < limit and batches_done < _MAX_SCAN_BATCHES:
         try:
             records, next_offset = client.scroll(
                 collection_name=col,
@@ -181,6 +190,7 @@ def qdrant_text_search(
             logger.error("qdrant_text_search scroll failed: %s", exc)
             break
 
+        batches_done += 1
         for r in records:
             payload = r.payload or {}
             content = payload.get("answer") or payload.get("text", "")
@@ -196,5 +206,13 @@ def qdrant_text_search(
             break
         pg_offset = next_offset
 
-    logger.debug("qdrant_text_search (fallback scan) '%s' → %d matches", text[:60], len(found))
+    if batches_done >= _MAX_SCAN_BATCHES:
+        logger.warning(
+            "qdrant_text_search: scan cap reached (%d batches) — results may be incomplete",
+            _MAX_SCAN_BATCHES,
+        )
+    logger.debug(
+        "qdrant_text_search (fallback scan) '%s' → %d matches in %d batches",
+        text[:60], len(found), batches_done,
+    )
     return found
