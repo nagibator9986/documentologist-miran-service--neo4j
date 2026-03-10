@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import threading
 import time
 from typing import Any
 
@@ -15,11 +16,23 @@ from ..core.config import get_settings
 logger = logging.getLogger(__name__)
 
 
-# Module-level thread pool — created once, reused for every pg_save_message_sync call.
-# Avoids the overhead of creating/destroying a ThreadPoolExecutor per invocation.
-_sync_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=2, thread_name_prefix="pg-sync"
-)
+# Thread pool for bridging async PG calls from sync context.
+# Created lazily on first use so pool size is read from config (not at import time).
+_sync_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_sync_executor_lock = threading.Lock()
+
+
+def _get_sync_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _sync_executor
+    if _sync_executor is None:
+        with _sync_executor_lock:
+            if _sync_executor is None:
+                s = get_settings()
+                _sync_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=s.pg_thread_workers,
+                    thread_name_prefix="pg-sync",
+                )
+    return _sync_executor
 
 
 def _run_coro_sync(coro: Any, *, timeout: int = 10) -> Any:
@@ -28,12 +41,12 @@ def _run_coro_sync(coro: Any, *, timeout: int = 10) -> Any:
     Strategy:
     - If no event loop is running → use asyncio.run() directly.
     - If an event loop IS running (e.g. inside FastAPI) → execute in a reusable
-      thread via _sync_executor to avoid nesting (no per-call pool creation).
+      thread via the lazy executor to avoid nesting (no per-call pool creation).
     """
     try:
         asyncio.get_running_loop()
         # Running inside an event loop — delegate to the module-level worker pool
-        future = _sync_executor.submit(asyncio.run, coro)
+        future = _get_sync_executor().submit(asyncio.run, coro)
         return future.result(timeout=timeout)
     except RuntimeError:
         # No running event loop — safe to call asyncio.run() directly
@@ -149,11 +162,14 @@ async def _get_pg_pool() -> Any:
         s = get_settings()
         _pg_pool = await asyncpg.create_pool(
             dsn=s.postgres_dsn,
-            min_size=1,
-            max_size=5,
+            min_size=s.pg_pool_min_size,
+            max_size=s.pg_pool_max_size,
             command_timeout=s.postgres_timeout,
         )
-        logger.info("asyncpg pool created (min=1, max=5)")
+        logger.info(
+            "asyncpg pool created (min=%d, max=%d)",
+            s.pg_pool_min_size, s.pg_pool_max_size,
+        )
     return _pg_pool
 
 

@@ -1,14 +1,24 @@
-"""Search Agent — hybrid RAG: Qdrant + BM25 + Neo4j + reranking + citations.
+"""Search Agent — hybrid RAG pipeline orchestrator.
 
-Improvements:
-- Query expansion via LLM rewrite before embedding (better recall)
-- Uses s.history_turns from config (not hardcoded 2)
-- Confidence calibration: explicit "not found" when context is weak
-- Structured retrieval metrics logged for observability
-- Multi-intent: prepends combined_responses from prior agents
+Pipeline stages (each is a focused private function):
+  1. _prepare_query       — referential enrichment + LLM query expansion
+  2. _detect_exact_search — quoted / prefix-based exact match detection
+  3. _retrieve_exact      — Qdrant MatchText search for literal strings
+  4. _retrieve_vector_bm25 — vector search + BM25 lexical reranking + merge
+  5. _retrieve_graph      — parallel Neo4j enrichment (sections, articles,
+                             obligations, entities, laws)
+  6. _normalize_graph_hits — convert raw graph records to unified hit dicts
+  7. _merge_all_hits      — combine all hit sources, deduplicating by ID
+  8. _filter_by_relevance — drop low-cosine hits, fall back to all if empty
+  9. _rerank_and_calibrate — cross-encoder reranking + confidence threshold
+ 10. _build_llm_prompt    — assemble context string for the LLM call
+ 11. _generate_answer     — LLM generation with history
+ 12. _build_citations     — format structured citation list
+ 13. search_node          — orchestrator: wires the pipeline, returns state
 """
 from __future__ import annotations
 
+import json as _json
 import logging
 import re
 import time
@@ -16,10 +26,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from ..core.config import get_settings
+from ..core.config import Settings, get_settings
 from ..core.llm import get_llm, invoke_with_retry
-from ..core.utils import build_history_messages
+from ..core.utils import (
+    DOC_REF_RE,
+    build_final_response,
+    build_history_messages,
+    extract_recent_filename,
+)
 from ..graph.state import AgentState
+from ..prompts import SEARCH_EXPERT, SEARCH_EXPAND_QUERY
 from ..tools.bm25_search import bm25_search
 from ..tools.neo4j_query import (
     graph_entity_lookup,
@@ -30,9 +46,12 @@ from ..tools.neo4j_query import (
 from ..tools.qdrant_search import qdrant_search, qdrant_text_search
 from ..tools.reranker import reranker
 
+logger = logging.getLogger(__name__)
+
+# ── Domain-specific regex patterns ───────────────────────────────────────────
+
 _ARTICLE_NUM_RE = re.compile(r"[Сс]тать[яей]\s+(\d+)", re.UNICODE)
 
-# Entity query detection: legal entity prefixes or 2+ consecutive capitalized words
 _ENTITY_ORG_RE = re.compile(
     r'\b(ТОО|АО|НАО|ОАО|ЗАО|ГП|ЧП|МФО|БВУ|Kaspi|Halyk|БТА|Цесна|Jusan|Нурбанк|Евразийский|Bereke)\b',
     re.UNICODE,
@@ -41,20 +60,16 @@ _CAPS_SEQUENCE_RE = re.compile(
     r'\b[А-ЯЁ][а-яё]{2,}(?:\s+[А-ЯЁ][а-яё]{2,}){1,}\b',
     re.UNICODE,
 )
-
-# Law name detection in queries — to trigger a Law node search
 _LAW_QUERY_RE = re.compile(
     r'(?:Закон\s+(?:РК|Республики\s+Казахстан)\s+о[б]?\s+[а-яёА-ЯЁ][а-яё\s,]{4,50}'
     r'|(?:Гражданский|Налоговый|Трудовой|Уголовный)\s+кодекс'
     r'|(?:ГК|НК|ТК|КоАП|УК)\s+(?:РК|Республики\s+Казахстан))',
     re.IGNORECASE | re.UNICODE,
 )
-
 _OBL_KEYWORDS = frozenset([
     "обяза", "должен", "обязан", "ответствен", "вправе", "право ",
     "запрещ", "недопустим", "обязательств",
 ])
-
 _QUOTED_TEXT_RE = re.compile(
     r'["\u00ab\u201c\u2018](.{8,}?)["\u00bb\u201d\u2019]', re.UNICODE | re.DOTALL
 )
@@ -70,27 +85,10 @@ _EXACT_SEARCH_PREFIXES: tuple[str, ...] = (
     "в каком документе есть ",
     "в каком файле находится ",
     "какой документ содержит ",
-    "найди строку ",
-    "найди фрагмент ",
-    "найди текст ",
-    "найди цитату ",
-    "найди точный ",
-    "найди дословно ",
-    "есть ли строка ",
-    "содержит строку ",
-    "в каком документе ",
-    "в каком файле ",
+    "найди строку ", "найди фрагмент ", "найди текст ", "найди цитату ",
+    "найди точный ", "найди дословно ", "есть ли строка ", "содержит строку ",
+    "в каком документе ", "в каком файле ",
 )
-
-logger = logging.getLogger(__name__)
-
-_DOC_REF_RE = re.compile(
-    r"\b(этот\s+документ|этого\s+документа|в\s+нём|в\s+нем|в\s+ней|об\s+этом|данный\s+документ|"
-    r"этот\s+файл|в\s+этом\s+документе|из\s+этого\s+документа|этот\s+текст)\b",
-    re.IGNORECASE | re.UNICODE,
-)
-_FILENAME_RE = re.compile(r"[\w\-]+\.(?:pdf|docx|doc|txt|json)\b", re.IGNORECASE)
-
 _RU_STOPWORDS = frozenset([
     "и", "в", "на", "по", "с", "к", "о", "об", "из", "от", "до", "для",
     "что", "как", "это", "все", "при", "или", "но", "не", "да", "же",
@@ -99,39 +97,23 @@ _RU_STOPWORDS = frozenset([
     "эта", "эти", "того", "тот", "за", "со", "во", "без", "под", "над",
 ])
 
-_SYSTEM = """Ты — эксперт по банковскому праву и финансовым продуктам Казахстана.
-Используй предоставленный контекст для точного, структурированного ответа.
-Указывай источники в конце ответа в формате [Источник N].
-Если информации нет в контексте — скажи об этом прямо, не придумывай.
-ВАЖНО: Отвечай ТОЛЬКО на русском языке, независимо от языка запроса и контекста.
-"""
 
-# Minimum sigmoid-normalised rerank_score to consider context reliable
-_MIN_CONFIDENCE = 0.25
-
-
-def _recent_filename(state: AgentState) -> str | None:
-    for msg in reversed((state.get("messages") or [])[:-1]):
-        content = getattr(msg, "content", "") or ""
-        matches = _FILENAME_RE.findall(content)
-        if matches:
-            return matches[0]
-    return None
-
+# ── Small data helpers ────────────────────────────────────────────────────────
 
 def _extract_graph_keywords(query: str, max_words: int) -> str:
+    """Return significant words from query for Neo4j keyword search."""
     words = re.findall(r"[а-яёА-ЯЁa-zA-Z0-9]+", query)
     significant = [w for w in words if w.lower() not in _RU_STOPWORDS and len(w) >= 3]
     return " ".join(significant[:max_words])
 
 
-def _extract_filename(hit: dict) -> str:
-    import json as _json
+def _extract_filename_from_hit(hit: dict) -> str:
+    """Extract the source filename from a Qdrant hit's payload metadata."""
     meta = hit.get("metadata", {})
-    meta_json_raw = meta.get("meta_json")
-    if meta_json_raw:
+    raw = meta.get("meta_json")
+    if raw:
         try:
-            inner = _json.loads(meta_json_raw) if isinstance(meta_json_raw, str) else meta_json_raw
+            inner = _json.loads(raw) if isinstance(raw, str) else raw
             if isinstance(inner, dict) and inner.get("filename"):
                 return str(inner["filename"])
         except Exception:
@@ -146,37 +128,9 @@ def _extract_filename(hit: dict) -> str:
     return ""
 
 
-def _expand_query(query: str) -> str:
-    """Rewrite the query using LLM for better semantic retrieval.
-
-    Adds synonyms and clarifies legal terms. Returns original query on any error
-    so retrieval is never blocked.
-    """
-    if len(query) < 15:
-        return query
-
-    llm = get_llm(temperature=0.0, num_predict=120)
-    prompt = (
-        "Ты — помощник по поиску в банковских и юридических документах Казахстана.\n"
-        "Перепиши запрос так, чтобы улучшить семантический поиск: добавь синонимы, "
-        "раскрой сокращения, уточни юридические термины.\n"
-        "Верни ТОЛЬКО улучшенный запрос без объяснений.\n\n"
-        f"Исходный запрос: {query}\n"
-        "Улучшенный запрос:"
-    )
-    try:
-        expanded = invoke_with_retry(llm, [HumanMessage(content=prompt)], max_retries=1).strip()
-        if expanded and expanded != query and len(expanded) < 600:
-            logger.debug("query_expansion: '%s' -> '%s'", query[:60], expanded[:60])
-            return expanded
-    except Exception as exc:
-        logger.debug("query_expansion failed (non-critical): %s", exc)
-    return query
-
-
-def _page_num(d: dict) -> str | None:
-    import json as _json
-    meta = d.get("metadata", {})
+def _extract_page_num(hit: dict) -> str | None:
+    """Extract page number from a Qdrant hit's payload metadata."""
+    meta = hit.get("metadata", {})
     pn = meta.get("page_number") or meta.get("page")
     if pn is not None:
         return str(pn)
@@ -192,93 +146,130 @@ def _page_num(d: dict) -> str | None:
     return None
 
 
-def search_node(state: AgentState) -> AgentState:
-    """Execute hybrid retrieval: vector + BM25 + graph, then rerank and answer."""
-    t_start = time.perf_counter()
-    s = get_settings()
-    query = state["user_query"]
+# ── Stage 1: Query preparation ────────────────────────────────────────────────
+
+def _prepare_query(query: str, state: AgentState) -> tuple[str, str]:
+    """Enrich referential queries and produce an expanded embedding query.
+
+    Returns:
+        (lexical_query, embed_query) — lexical keeps original wording for BM25;
+        embed_query is LLM-rewritten for better semantic recall.
+    """
+    if DOC_REF_RE.search(query):
+        filename = extract_recent_filename(state)
+        if filename:
+            query = f"{filename} {query}"
+            logger.info("search: referential query enriched with filename=%s", filename)
+
+    embed_query = _expand_query(query)
+    return query, embed_query
+
+
+def _expand_query(query: str) -> str:
+    """LLM rewrite for better semantic retrieval. Non-fatal — returns original on error."""
+    if len(query) < 15:
+        return query
+
+    llm = get_llm(temperature=0.0, num_predict=120)
+    prompt = SEARCH_EXPAND_QUERY.format(query=query)
+    try:
+        expanded = invoke_with_retry(
+            llm, [HumanMessage(content=prompt)], max_retries=1
+        ).strip()
+        if expanded and expanded != query and len(expanded) < 600:
+            logger.debug("query_expansion: '%s' -> '%s'", query[:60], expanded[:60])
+            return expanded
+    except Exception as exc:
+        logger.debug("query_expansion failed (non-critical): %s", exc)
+    return query
+
+
+# ── Stage 2: Exact-string search detection ────────────────────────────────────
+
+def _detect_exact_search(query: str) -> tuple[bool, str]:
+    """Determine whether the query requests a literal substring match.
+
+    Returns:
+        (is_exact, exact_text) — exact_text is the string to search for.
+    """
     query_lower = query.lower()
+    quoted = _QUOTED_TEXT_RE.search(query)
+    is_exact = bool(quoted or any(kw in query_lower for kw in _EXACT_SEARCH_KW))
 
-    # ── 0a. Referential query enrichment ("этот документ" etc.) ─────────────
-    _ref_filename: str | None = None
-    if _DOC_REF_RE.search(query):
-        _ref_filename = _recent_filename(state)
-        if _ref_filename:
-            query = f"{_ref_filename} {query}"
-            query_lower = query.lower()
-            logger.info("search_node: referential query enriched with filename=%s", _ref_filename)
+    if not is_exact:
+        return False, ""
 
-    # ── 0b. Query expansion via LLM rewrite ──────────────────────────────────
-    query_expanded = _expand_query(query)
-    # Use expanded query for embeddings; original for BM25/graph (lexical match)
-    embed_query = query_expanded
+    if quoted:
+        return True, quoted.group(1).strip()
 
-    # ── 0c. Exact-string search detection ────────────────────────────────────
-    exact_hits: list[dict] = []
-    exact_text: str = ""
-    quoted_match = _QUOTED_TEXT_RE.search(query)
-    is_exact_search = bool(quoted_match or any(kw in query_lower for kw in _EXACT_SEARCH_KW))
+    search_text = query
+    for prefix in _EXACT_SEARCH_PREFIXES:
+        if query_lower.startswith(prefix):
+            search_text = query[len(prefix):].strip()
+            break
+    return True, search_text
 
-    if is_exact_search:
-        if quoted_match:
-            exact_text = quoted_match.group(1).strip()
-        else:
-            search_text = query
-            for prefix in _EXACT_SEARCH_PREFIXES:
-                if query_lower.startswith(prefix):
-                    search_text = query[len(prefix):].strip()
-                    break
-            exact_text = search_text
-        if exact_text:
-            try:
-                exact_hits = qdrant_text_search.invoke({
-                    "text": exact_text,
-                    "collection": s.qdrant_collection,
-                    "limit": 8,
-                })
-                logger.info("qdrant_text_search '%s' -> %d exact matches", exact_text[:60], len(exact_hits))
-            except Exception as exc:
-                logger.warning("qdrant_text_search failed: %s", exc)
 
-    exact_hit_ids: set[str] = {str(h.get("id")) for h in exact_hits if h.get("id")}
+# ── Stage 3: Exact Qdrant text search ────────────────────────────────────────
 
-    # ── 1. Vector search (expanded query for better recall) ──────────────────
+def _retrieve_exact(exact_text: str, s: Settings) -> list[dict]:
+    """Run Qdrant server-side MatchText search. Non-fatal."""
+    if not exact_text:
+        return []
+    try:
+        hits = qdrant_text_search.invoke({
+            "text": exact_text,
+            "collection": s.qdrant_collection,
+            "limit": 8,
+        })
+        logger.info("exact_search '%s' -> %d hits", exact_text[:60], len(hits))
+        return hits
+    except Exception as exc:
+        logger.warning("exact_search failed: %s", exc)
+        return []
+
+
+# ── Stage 4: Vector + BM25 retrieval ─────────────────────────────────────────
+
+def _retrieve_vector_bm25(
+    embed_query: str, lexical_query: str, s: Settings
+) -> tuple[list[dict], list[dict]]:
+    """Run Qdrant vector search, then BM25 over its results.
+
+    Returns:
+        (vector_hits, bm25_hits)
+    """
     vector_hits = qdrant_search.invoke({
         "query": embed_query,
         "collection": s.qdrant_collection,
         "limit": s.qdrant_top_k,
     })
-
-    # ── 2. BM25 lexical re-ranking over vector candidates ────────────────────
     bm25_hits = bm25_search.invoke({
-        "query": query,  # original query for BM25
+        "query": lexical_query,
         "documents": vector_hits,
         "top_k": s.bm25_top_k,
     })
+    return vector_hits, bm25_hits
 
-    # ── 3. Merge & deduplicate ────────────────────────────────────────────────
-    seen_ids: set[str] = set()
-    merged = []
-    for idx, hit in enumerate(exact_hits + vector_hits + bm25_hits):
-        raw_id = hit.get("id")
-        hit_id = str(raw_id) if raw_id else f"idx:{idx}:{hash(hit.get('content', ''))}"
-        if hit_id not in seen_ids:
-            seen_ids.add(hit_id)
-            merged.append(hit)
 
-    # ── 4. Graph enrichment — parallel execution ──────────────────────────────
-    # section search, article lookup, obligation search, entity lookup, law search
-    # all run concurrently in threads.
+# ── Stage 5: Parallel Neo4j graph enrichment ─────────────────────────────────
+
+def _retrieve_graph(query: str, s: Settings) -> dict[str, list[dict]]:
+    """Run 5 graph queries in parallel with a timeout.
+
+    Returns dict with keys: sections, articles, obligations, entities, laws.
+    Any individual query failure is non-fatal (returns empty list for that key).
+    """
     kw = _extract_graph_keywords(query, s.graph_kw_max_words)
     art_match = _ARTICLE_NUM_RE.search(query)
     needs_obligations = any(ob_kw in query.lower() for ob_kw in _OBL_KEYWORDS)
     needs_entities = bool(_ENTITY_ORG_RE.search(query) or _CAPS_SEQUENCE_RE.search(query))
     law_match = _LAW_QUERY_RE.search(query)
 
-    def _graph_sections() -> list[dict]:
+    def _sections() -> list[dict]:
         return graph_section_search.invoke({"keywords": kw, "limit": 4})
 
-    def _graph_articles() -> list[dict]:
+    def _articles() -> list[dict]:
         if not art_match:
             return []
         return neo4j_query.invoke({
@@ -291,75 +282,69 @@ def search_node(state: AgentState) -> AgentState:
             "params": {"num": int(art_match.group(1))},
         })
 
-    def _graph_obligations() -> list[dict]:
+    def _obligations() -> list[dict]:
         if not needs_obligations:
             return []
-        return graph_obligation_search.invoke({
-            "keywords": kw,
-            "limit": 3,
-        })
+        return graph_obligation_search.invoke({"keywords": kw, "limit": 3})
 
-    def _graph_entities() -> list[dict]:
+    def _entities() -> list[dict]:
         if not needs_entities:
             return []
         return graph_entity_lookup.invoke({"text": kw[:60], "limit": 4})
 
-    def _graph_law_search() -> list[dict]:
+    def _laws() -> list[dict]:
         if not law_match:
             return []
-        law_text = law_match.group(0)[:80]
         return neo4j_query.invoke({
             "cypher": (
                 "MATCH (l:Law) "
                 "WHERE toLower(l.title) CONTAINS toLower($kw) "
                 "OPTIONAL MATCH (l)-[:HAS_ARTICLE]->(a:Article) "
                 "RETURN l.law_id AS law_id, l.title AS title, "
-                "collect({number: a.number, title: a.title}) AS articles "
-                "LIMIT 3"
+                "collect({number: a.number, title: a.title}) AS articles LIMIT 3"
             ),
-            "params": {"kw": law_text},
+            "params": {"kw": law_match.group(0)[:80]},
         })
 
-    raw_sections: list[dict] = []
-    art_records: list[dict] = []
-    obl_records: list[dict] = []
-    ent_records: list[dict] = []
-    law_records: list[dict] = []
+    results: dict[str, list[dict]] = {
+        k: [] for k in ("sections", "articles", "obligations", "entities", "laws")
+    }
+    task_map = {
+        "sections": _sections,
+        "articles": _articles,
+        "obligations": _obligations,
+        "entities": _entities,
+        "laws": _laws,
+    }
 
     with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {
-            pool.submit(_graph_sections): "sections",
-            pool.submit(_graph_articles): "articles",
-            pool.submit(_graph_obligations): "obligations",
-            pool.submit(_graph_entities): "entities",
-            pool.submit(_graph_law_search): "laws",
-        }
+        futures = {pool.submit(fn): name for name, fn in task_map.items()}
         try:
-            for future in as_completed(futures, timeout=8):
-                label = futures[future]
+            for future in as_completed(futures, timeout=s.graph_enrichment_timeout):
+                name = futures[future]
                 try:
-                    result = future.result()
-                    if label == "sections":
-                        raw_sections = result
-                    elif label == "articles":
-                        art_records = result
-                    elif label == "obligations":
-                        obl_records = result
-                    elif label == "entities":
-                        ent_records = result
-                    else:
-                        law_records = result
+                    results[name] = future.result()
                 except Exception as exc:
-                    logger.warning("Graph %s lookup failed: %s", label, exc)
+                    logger.warning("graph_%s lookup failed: %s", name, exc)
         except TimeoutError:
-            # Some graph queries exceeded 8s — use whatever results arrived so far
-            logger.warning("search_node: graph enrichment timeout (8s) — using partial results")
+            logger.warning(
+                "search: graph enrichment timeout (%.1fs) — using partial results",
+                s.graph_enrichment_timeout,
+            )
 
-    graph_hits: list[dict] = []
-    for sec in raw_sections:
+    return results
+
+
+# ── Stage 6: Normalize graph records to unified hit format ───────────────────
+
+def _normalize_graph_hits(graph_results: dict[str, list[dict]], s: Settings) -> list[dict]:
+    """Convert raw Neo4j records to the same dict shape as Qdrant hits."""
+    hits: list[dict] = []
+
+    for sec in graph_results.get("sections", []):
         text = sec.get("text") or ""
         if text:
-            graph_hits.append({
+            hits.append({
                 "id": sec.get("section_id", ""),
                 "content": text[:s.content_snippet_max_len],
                 "score": float(sec.get("score", 0.0)),
@@ -367,91 +352,52 @@ def search_node(state: AgentState) -> AgentState:
                 "metadata": {"articles": sec.get("articles", [])},
             })
 
-    # ── 5. Filter by minimum cosine score ────────────────────────────────────
-    relevant_qdrant = [h for h in merged if h.get("score", 0) >= s.min_relevance_score]
-    if not relevant_qdrant and merged:
-        logger.warning(
-            "search_node: all %d hits below min_relevance_score=%.2f — using all",
-            len(merged), s.min_relevance_score,
-        )
-        relevant_qdrant = merged
+    for rec in graph_results.get("articles", []):
+        if rec.get("text"):
+            art_num = rec.get("number", "?")
+            title_part = f": {rec['title']}" if rec.get("title") else ""
+            hits.append({
+                "id": f"article:{art_num}:{rec.get('source', '')}",
+                "content": f"Статья {art_num}{title_part}\n{rec['text'][:s.content_snippet_max_len]}",
+                "score": 1.0,
+                "section": rec.get("source", ""),
+                "metadata": {"article_number": art_num, "article_title": rec.get("title", "")},
+            })
 
-    # ── 5b. Merge graph hits (bypass cosine filter) ───────────────────────────
-    # Reuse seen_ids from step 3 — no need to rebuild a second set from scratch.
-    for gh in graph_hits:
-        raw_id = gh.get("id")
-        gh_id = str(raw_id) if raw_id else f"graph:{hash(gh.get('content', ''))}"
-        if gh_id not in seen_ids:
-            seen_ids.add(gh_id)
-            relevant_qdrant.append(gh)
-
-    # ── 5c. Merge article results ─────────────────────────────────────────────
-    if art_match:
-        art_num = int(art_match.group(1))
-        for rec in art_records:
-            if rec.get("text"):
-                art_id = f"article:{art_num}:{rec.get('source', '')}"
-                if art_id not in seen_ids:
-                    seen_ids.add(art_id)
-                    title_part = f": {rec['title']}" if rec.get("title") else ""
-                    relevant_qdrant.append({
-                        "id": art_id,
-                        "content": (
-                            f"Статья {art_num}{title_part}\n"
-                            f"{rec.get('text', '')[:s.content_snippet_max_len]}"
-                        ),
-                        "score": 1.0,
-                        "section": rec.get("source", ""),
-                        "metadata": {
-                            "article_number": art_num,
-                            "article_title": rec.get("title", ""),
-                        },
-                    })
-
-    # ── 5d. Merge obligation results ──────────────────────────────────────────
-    for rec in obl_records:
+    for rec in graph_results.get("obligations", []):
         content = " — ".join(
             p for p in [rec.get("subject"), rec.get("action"), rec.get("object")] if p
         )
         if rec.get("evidence"):
             content += f"\n{rec['evidence']}"
-        obl_id = f"obl:{rec.get('doc_id', '')}:{hash(content)}"
-        if obl_id not in seen_ids:
-            seen_ids.add(obl_id)
-            relevant_qdrant.append({
-                "id": obl_id,
-                "content": content[:s.content_snippet_max_len],
-                "score": float(rec.get("confidence", 0.7)),
-                "section": rec.get("document", ""),
-                "metadata": {"type": "obligation", "deadline": rec.get("deadline", "")},
-            })
+        hits.append({
+            "id": f"obl:{rec.get('doc_id', '')}:{hash(content)}",
+            "content": content[:s.content_snippet_max_len],
+            "score": float(rec.get("confidence", 0.7)),
+            "section": rec.get("document", ""),
+            "metadata": {"type": "obligation", "deadline": rec.get("deadline", "")},
+        })
 
-    # ── 5e. Merge entity results ──────────────────────────────────────────────
-    for rec in ent_records:
+    for rec in graph_results.get("entities", []):
         ent_text = rec.get("text", "")
-        ent_label = rec.get("label", "")
         if not ent_text:
             continue
+        ent_label = rec.get("label", "")
         content_parts = [f"{ent_label}: {ent_text}"]
         if rec.get("role"):
             content_parts.append(f"Роль: {rec['role']}")
         if rec.get("evidence"):
             content_parts.append(rec["evidence"])
-        content = "\n".join(content_parts)
         docs = rec.get("documents") or []
-        ent_id = f"ent:{ent_label}:{ent_text}"
-        if ent_id not in seen_ids:
-            seen_ids.add(ent_id)
-            relevant_qdrant.append({
-                "id": ent_id,
-                "content": content[:s.content_snippet_max_len],
-                "score": float(rec.get("confidence", 0.6)),
-                "section": ", ".join(docs[:2]) if docs else "",
-                "metadata": {"type": "entity", "entity_label": ent_label, "entity_text": ent_text},
-            })
+        hits.append({
+            "id": f"ent:{ent_label}:{ent_text}",
+            "content": "\n".join(content_parts)[:s.content_snippet_max_len],
+            "score": float(rec.get("confidence", 0.6)),
+            "section": ", ".join(docs[:2]) if docs else "",
+            "metadata": {"type": "entity", "entity_label": ent_label, "entity_text": ent_text},
+        })
 
-    # ── 5f. Merge law search results ──────────────────────────────────────────
-    for rec in law_records:
+    for rec in graph_results.get("laws", []):
         law_title = rec.get("title", "")
         if not law_title:
             continue
@@ -463,129 +409,252 @@ def search_node(state: AgentState) -> AgentState:
         content = f"Закон: {law_title}"
         if art_list:
             content += f"\nСтатьи: {art_list}"
-        law_id = f"law:{rec.get('law_id', law_title)}"
-        if law_id not in seen_ids:
-            seen_ids.add(law_id)
-            relevant_qdrant.append({
-                "id": law_id,
-                "content": content[:s.content_snippet_max_len],
-                "score": 1.0,
-                "section": law_title,
-                "metadata": {"type": "law", "law_id": rec.get("law_id", "")},
-            })
+        hits.append({
+            "id": f"law:{rec.get('law_id', law_title)}",
+            "content": content[:s.content_snippet_max_len],
+            "score": 1.0,
+            "section": law_title,
+            "metadata": {"type": "law", "law_id": rec.get("law_id", "")},
+        })
 
-    relevant = relevant_qdrant
+    return hits
 
-    # ── 6. Cross-encoder reranking ────────────────────────────────────────────
-    rerank_input = sorted(
-        relevant, key=lambda d: float(d.get("score", 0)), reverse=True
+
+# ── Stage 7: Merge all hit sources, deduplicating by ID ──────────────────────
+
+def _merge_all_hits(
+    exact_hits: list[dict],
+    vector_hits: list[dict],
+    bm25_hits: list[dict],
+    graph_hits: list[dict],
+) -> tuple[list[dict], set[str]]:
+    """Combine all hit sources into a single deduplicated list.
+
+    Graph hits bypass the cosine-score filter in stage 8 and are appended after
+    it, so they are returned separately in the second position.
+
+    Returns:
+        (qdrant_merged, seen_ids) — qdrant_merged contains exact+vector+bm25 hits.
+        seen_ids is passed to stage 8 to avoid double-adding graph hits.
+    """
+    seen_ids: set[str] = set()
+    merged: list[dict] = []
+
+    for idx, hit in enumerate(exact_hits + vector_hits + bm25_hits):
+        raw_id = hit.get("id")
+        hit_id = str(raw_id) if raw_id else f"idx:{idx}:{hash(hit.get('content', ''))}"
+        if hit_id not in seen_ids:
+            seen_ids.add(hit_id)
+            merged.append(hit)
+
+    # Graph hits added after deduplication pass so seen_ids stays accurate
+    for hit in graph_hits:
+        raw_id = hit.get("id")
+        hit_id = str(raw_id) if raw_id else f"graph:{hash(hit.get('content', ''))}"
+        if hit_id not in seen_ids:
+            seen_ids.add(hit_id)
+            merged.append(hit)
+
+    return merged, seen_ids
+
+
+# ── Stage 8: Relevance filtering ─────────────────────────────────────────────
+
+def _filter_by_relevance(hits: list[dict], s: Settings) -> list[dict]:
+    """Drop hits below min_relevance_score. Falls back to all if everything is filtered."""
+    filtered = [h for h in hits if h.get("score", 0) >= s.min_relevance_score]
+    if not filtered and hits:
+        logger.warning(
+            "search: all %d hits below min_relevance_score=%.2f — using all",
+            len(hits), s.min_relevance_score,
+        )
+        return hits
+    return filtered
+
+
+# ── Stage 9: Cross-encoder reranking + confidence calibration ────────────────
+
+def _rerank_and_calibrate(
+    query: str, candidates: list[dict], s: Settings
+) -> tuple[list[dict], float, bool]:
+    """Rerank with cross-encoder and decide whether context is usable.
+
+    Returns:
+        (reranked, best_score, has_context)
+    """
+    top_candidates = sorted(
+        candidates, key=lambda d: float(d.get("score", 0)), reverse=True
     )[:s.rerank_top_k * 2]
+
     reranked = (
-        reranker.invoke({"query": query, "documents": rerank_input, "top_k": s.rerank_top_k})
-        if rerank_input else []
+        reranker.invoke({"query": query, "documents": top_candidates, "top_k": s.rerank_top_k})
+        if top_candidates else []
     )
 
-    # ── 6b. Confidence calibration ────────────────────────────────────────────
     best_score = reranked[0].get("rerank_score", 0.0) if reranked else 0.0
-    has_context = bool(reranked) and best_score >= _MIN_CONFIDENCE
+    has_context = bool(reranked) and best_score >= s.search_min_confidence
+    return reranked, best_score, has_context
 
-    # ── 7. Build LLM prompt ───────────────────────────────────────────────────
-    def _ctx_content(d: dict) -> str:
-        if str(d.get("id", "")) in exact_hit_ids:
-            return d.get("content", "")[:1200]
-        return d.get("content", "")[:s.content_snippet_max_len]
 
-    if is_exact_search and exact_hits:
+# ── Stage 10: LLM prompt assembly ────────────────────────────────────────────
+
+def _build_llm_prompt(
+    query: str,
+    is_exact: bool,
+    exact_text: str,
+    exact_hits: list[dict],
+    exact_hit_ids: set[str],
+    reranked: list[dict],
+    has_context: bool,
+    best_score: float,
+    s: Settings,
+) -> str:
+    """Build the user message for the LLM based on retrieval results."""
+
+    def _ctx_snippet(d: dict) -> str:
+        """Return content at full length for exact hits, snippet length otherwise."""
+        limit = 1200 if str(d.get("id", "")) in exact_hit_ids else s.content_snippet_max_len
+        return d.get("content", "")[:limit]
+
+    if is_exact and exact_hits:
         exact_blocks = "\n\n".join(
             "─" * 60 + f"\n[Совпадение {i + 1}]\n"
-            f"Документ: {_extract_filename(h) or '—'}\n"
-            f"Страница: {_page_num(h) or '?'}\n"
+            f"Документ: {_extract_filename_from_hit(h) or '—'}\n"
+            f"Страница: {_extract_page_num(h) or '?'}\n"
             f"Секция: {h.get('section', '—')}\n"
             f"Найденный фрагмент:\n{h.get('content', '')[:1000]}"
             for i, h in enumerate(exact_hits[:5])
         )
-        user_msg = (
+        return (
             f"Пользователь ищет точный фрагмент текста в базе документов.\n\n"
             f"ИСКОМЫЙ ФРАГМЕНТ:\n{exact_text[:600]}\n\n"
             f"НАЙДЕННЫЕ СОВПАДЕНИЯ:\n{exact_blocks}\n\n"
-            f"Укажи точно: в каком документе найден фрагмент, на какой странице, в какой секции. "
-            f"Процитируй первые 2-3 строки найденного фрагмента из источника."
-        )
-    elif has_context:
-        context = "\n\n".join(
-            f"[{i + 1}] {_ctx_content(d)}" for i, d in enumerate(reranked)
-        )
-        user_msg = f"Контекст:\n{context}\n\nВопрос: {query}"
-    else:
-        # Confidence calibration: be honest — no hallucinations
-        logger.warning(
-            "search_node: low confidence (best_score=%.3f, docs=%d) for query=%r",
-            best_score, len(reranked), query,
-        )
-        user_msg = (
-            f"Вопрос: {query}\n\n"
-            "ВАЖНО: Релевантные документы в базе знаний не найдены (или уровень уверенности "
-            "слишком низкий). Сообщи об этом пользователю прямо и честно. "
-            "Не придумывай информацию. Предложи уточнить запрос или загрузить нужный документ."
+            "Укажи точно: в каком документе найден фрагмент, на какой странице, в какой секции. "
+            "Процитируй первые 2-3 строки найденного фрагмента из источника."
         )
 
-    # ── 8. Generate answer ────────────────────────────────────────────────────
+    if has_context:
+        context = "\n\n".join(
+            f"[{i + 1}] {_ctx_snippet(d)}" for i, d in enumerate(reranked)
+        )
+        return f"Контекст:\n{context}\n\nВопрос: {query}"
+
+    # Low-confidence path — honest "not found" rather than hallucination
+    logger.warning(
+        "search: low confidence (best_score=%.3f, docs=%d) for query=%r",
+        best_score, len(reranked), query,
+    )
+    return (
+        f"Вопрос: {query}\n\n"
+        "ВАЖНО: Релевантные документы в базе знаний не найдены (или уровень уверенности "
+        "слишком низкий). Сообщи об этом пользователю прямо и честно. "
+        "Не придумывай информацию. Предложи уточнить запрос или загрузить нужный документ."
+    )
+
+
+# ── Stage 11: LLM answer generation ──────────────────────────────────────────
+
+def _generate_answer(user_msg: str, state: AgentState, s: Settings) -> str:
+    """Call the LLM with system prompt + conversation history + retrieval context."""
     llm = get_llm()
     history = build_history_messages(state, max_turns=s.history_turns)
-    answer = invoke_with_retry(llm, [
-        SystemMessage(content=_SYSTEM),
+    return invoke_with_retry(llm, [
+        SystemMessage(content=SEARCH_EXPERT),
         *history,
         HumanMessage(content=user_msg),
     ])
 
-    # ── 9. Citations ──────────────────────────────────────────────────────────
-    citations = [
+
+# ── Stage 12: Citation builder ────────────────────────────────────────────────
+
+def _build_citations(
+    reranked: list[dict], exact_hit_ids: set[str], s: Settings
+) -> list[dict]:
+    """Format the reranked documents into structured citation records."""
+    return [
         {
             "index": i + 1,
             "content_preview": d.get("content", "")[:s.citation_preview_max_len],
             "match_content": d.get("content", "") if str(d.get("id", "")) in exact_hit_ids else "",
             "is_exact_match": str(d.get("id", "")) in exact_hit_ids,
-            "page_number": _page_num(d),
+            "page_number": _extract_page_num(d),
             "section": d.get("section", ""),
-            # rerank_score is sigmoid-normalised [0,1] — no /10 hack needed
             "score": d.get("rerank_score", d.get("score", 0)),
-            "filename": _extract_filename(d),
+            "filename": _extract_filename_from_hit(d),
             "metadata": d.get("metadata", {}),
         }
         for i, d in enumerate(reranked)
     ]
 
-    # ── 10. Multi-intent: prepend previous agents' responses ─────────────────
-    combined_prev = state.get("combined_responses") or []
-    if combined_prev:
-        final_response = "\n\n---\n\n".join(combined_prev) + "\n\n---\n\n" + answer
-    else:
-        final_response = answer
 
-    # ── 11. Structured retrieval metrics ─────────────────────────────────────
+# ── Graph entry point ─────────────────────────────────────────────────────────
+
+def search_node(state: AgentState) -> AgentState:
+    """Hybrid RAG pipeline node: vector + BM25 + graph → rerank → generate → cite."""
+    t_start = time.perf_counter()
+    s = get_settings()
+    query = state["user_query"]
+
+    # 1. Prepare query
+    lexical_query, embed_query = _prepare_query(query, state)
+
+    # 2-3. Exact-string search (when requested)
+    is_exact, exact_text = _detect_exact_search(lexical_query)
+    exact_hits = _retrieve_exact(exact_text, s) if is_exact else []
+    exact_hit_ids = {str(h.get("id")) for h in exact_hits if h.get("id")}
+
+    # 4. Vector + BM25
+    vector_hits, bm25_hits = _retrieve_vector_bm25(embed_query, lexical_query, s)
+
+    # 5-6. Graph enrichment + normalization
+    graph_results = _retrieve_graph(lexical_query, s)
+    graph_hits = _normalize_graph_hits(graph_results, s)
+
+    # 7. Merge all sources
+    merged, _ = _merge_all_hits(exact_hits, vector_hits, bm25_hits, graph_hits)
+
+    # 8. Relevance filter
+    relevant = _filter_by_relevance(merged, s)
+
+    # 9. Rerank + confidence
+    reranked, best_score, has_context = _rerank_and_calibrate(lexical_query, relevant, s)
+
+    # 10-11. Prompt + answer
+    user_msg = _build_llm_prompt(
+        lexical_query, is_exact, exact_text, exact_hits, exact_hit_ids,
+        reranked, has_context, best_score, s,
+    )
+    answer = _generate_answer(user_msg, state, s)
+
+    # 12. Citations
+    citations = _build_citations(reranked, exact_hit_ids, s)
+
+    # Multi-intent: prepend prior agents' responses
+    final_response = build_final_response(answer, state.get("combined_responses") or [])
+
     elapsed = time.perf_counter() - t_start
-    metrics: dict = {
+    metrics = {
         "node": "search",
-        "query_len": len(query),
-        "query_expanded": query_expanded != query,
+        "query_len": len(lexical_query),
+        "query_expanded": embed_query != lexical_query,
         "vector_hits": len(vector_hits),
         "bm25_hits": len(bm25_hits),
         "graph_hits": len(graph_hits),
-        "entity_hits": len(ent_records),
-        "law_hits": len(law_records),
+        "entity_hits": len(graph_results.get("entities", [])),
+        "law_hits": len(graph_results.get("laws", [])),
         "merged_hits": len(merged),
         "relevant_hits": len(relevant),
         "reranked_hits": len(reranked),
         "best_rerank_score": round(best_score, 4),
         "has_context": has_context,
-        "is_exact_search": is_exact_search,
+        "is_exact_search": is_exact,
         "elapsed_s": round(elapsed, 2),
     }
     logger.info("search_node metrics: %s", metrics)
 
     return {
         **state,
-        "query_expanded": query_expanded,
+        "query_expanded": embed_query,
         "vector_hits": vector_hits,
         "bm25_hits": bm25_hits,
         "graph_hits": graph_hits,

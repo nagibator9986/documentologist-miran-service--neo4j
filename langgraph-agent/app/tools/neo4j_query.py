@@ -7,12 +7,10 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from ..core.config import get_settings
 from ..core.utils import get_neo4j_driver
 
 logger = logging.getLogger(__name__)
-
-# Lucene fulltext index name (created by scripts/setup_neo4j.py)
-_FULLTEXT_INDEX = "sectionText"
 
 # Traversal depth limits to prevent runaway queries
 _MIN_DEPTH = 1
@@ -100,8 +98,9 @@ def graph_section_search(keywords: str, limit: int = 5) -> list[dict[str, Any]]:
         try:
             # Escape Lucene special chars to prevent query parse errors
             safe_kw = _escape_lucene(keywords)
+            fulltext_index = get_settings().neo4j_fulltext_index
             cypher = f"""
-                CALL db.index.fulltext.queryNodes('{_FULLTEXT_INDEX}', $kw)
+                CALL db.index.fulltext.queryNodes('{fulltext_index}', $kw)
                 YIELD node AS s, score
                 OPTIONAL MATCH (d:Document)-[:CONTAINS]->(s)
                 OPTIONAL MATCH (s)-[:HAS_ARTICLE]->(a:Article)
