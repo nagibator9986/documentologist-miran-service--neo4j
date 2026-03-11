@@ -144,6 +144,15 @@ class Settings(BaseSettings):
     # Example: http://ocr-api:8000
     ocr_service_url: str = "http://localhost:8000"
 
+    # ── MLflow Observability ──────────────────────────────────────────
+    # Set MLFLOW_ENABLED=true in .env to enable tracing.
+    # When false all tracing code is a no-op — zero overhead.
+    mlflow_enabled: bool = False
+    # MLflow tracking server URL (docker-compose: http://mlflow:5000)
+    mlflow_tracking_uri: str = "http://localhost:5000"
+    # Experiment groups all runs for this service together in the UI
+    mlflow_experiment_name: str = "miran-agent"
+
 
 @lru_cache
 def get_settings() -> Settings:

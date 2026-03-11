@@ -27,6 +27,7 @@ from ..agents.memory_agent import memory_load_node, memory_save_node
 from ..agents.search_agent import search_node
 from ..agents.supervisor import classify_intent
 from ..agents.verify_agent import verify_node
+from ..core.tracing import trace_node
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -104,13 +105,17 @@ def build_graph() -> StateGraph:
     builder = StateGraph(AgentState)
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
+    # Agent nodes are wrapped with trace_node so each execution becomes an
+    # MLflow child span under the top-level autolog trace for graph.invoke().
+    # Utility nodes (memory_load/save, advance_intent) are left unwrapped —
+    # they contain no LLM calls and their I/O latency is measured by autolog.
     builder.add_node("memory_load",    memory_load_node)
-    builder.add_node("supervisor",     classify_intent)
-    builder.add_node("ingest",         ingest_node)
-    builder.add_node("search",         search_node)
-    builder.add_node("verify",         verify_node)
-    builder.add_node("generate",       generate_node)
-    builder.add_node("analyze",        analyze_node)
+    builder.add_node("supervisor",     trace_node(classify_intent))
+    builder.add_node("ingest",         trace_node(ingest_node))
+    builder.add_node("search",         trace_node(search_node))
+    builder.add_node("verify",         trace_node(verify_node))
+    builder.add_node("generate",       trace_node(generate_node))
+    builder.add_node("analyze",        trace_node(analyze_node))
     builder.add_node("advance_intent", advance_intent_node)
     builder.add_node("memory_save",    memory_save_node)
 
