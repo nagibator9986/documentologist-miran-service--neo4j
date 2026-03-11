@@ -1,4 +1,8 @@
-"""Supervisor Agent — intent classification and routing (supports multi-intent)."""
+"""Supervisor Agent — intent classification (supports multi-intent).
+
+Responsibility: classify the user query into one or two agent intents and
+write them to state.  Routing is the graph's responsibility (workflow.py).
+"""
 from __future__ import annotations
 
 import logging
@@ -11,25 +15,9 @@ from ..core.config import get_settings
 from ..core.llm import get_llm, invoke_with_retry
 from ..core.utils import build_history_messages
 from ..graph.state import AgentState
+from ..prompts import SUPERVISOR_CLASSIFY
 
 logger = logging.getLogger(__name__)
-
-_SYSTEM_PROMPT = """Classify the user request into EXACTLY one of these intents (output the single English word only):
-
-search   - find information, answer questions, retrieve documents
-           Examples: "что такое", "расскажи про", "найди", "какие права", "как работает", "объясни"
-analyze  - compare documents/articles, summarize, extract entities
-           Examples: "сравни", "отличие между", "разница", "резюмируй", "извлеки", "перечисли сущности"
-verify   - check compliance, find violations, assess legal risk
-           Examples: "проверь на соответствие", "есть ли нарушения", "оцени риски"
-generate - create a new document (contract, report, letter)
-           Examples: "составь договор", "создай отчёт", "напиши письмо", "сгенерируй"
-ingest   - upload document, check processing status, manage indexed files
-           Examples: "загрузи документ", "статус обработки", "добавь файл", "проиндексируй", "какие документы загружены"
-
-If TWO different operations are needed, output both separated by comma, e.g.: search,verify
-
-Output ONLY the intent word(s), nothing else."""
 
 Intent = Literal["ingest", "search", "verify", "generate", "analyze"]
 _VALID_INTENTS = {"ingest", "search", "verify", "generate", "analyze"}
@@ -144,10 +132,10 @@ def classify_intent(state: AgentState) -> AgentState:
 
     # 3. LLM fallback for ambiguous queries
     s = get_settings()
-    llm = get_llm(temperature=0.0, num_predict=32)
+    llm = get_llm(temperature=0.0, num_predict=s.supervisor_num_predict)
     history = build_history_messages(state, max_turns=s.history_turns)
     raw = invoke_with_retry(llm, [
-        SystemMessage(content=_SYSTEM_PROMPT),
+        SystemMessage(content=SUPERVISOR_CLASSIFY),
         *history,
         HumanMessage(content=query),
     ]) or "search"
@@ -163,7 +151,3 @@ def classify_intent(state: AgentState) -> AgentState:
         "combined_responses": state.get("combined_responses") or [],
     }
 
-
-def route_intent(state: AgentState) -> str:
-    """LangGraph conditional edge — returns the next node name."""
-    return state.get("intent", "search")

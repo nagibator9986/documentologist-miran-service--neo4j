@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import threading
 from typing import TYPE_CHECKING, Any
 
@@ -13,8 +14,58 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Shared regex patterns (used across multiple agents)
+# ---------------------------------------------------------------------------
+
+# Detects referential phrases like "этот документ", "в нём", "данный файл"
+DOC_REF_RE = re.compile(
+    r"\b(этот\s+документ|этого\s+документа|в\s+нём|в\s+нем|в\s+ней|об\s+этом|данный\s+документ|"
+    r"этот\s+файл|в\s+этом\s+документе|из\s+этого\s+документа|этот\s+текст)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Matches common document filenames (pdf, docx, doc, txt, json)
+FILENAME_RE = re.compile(r"[\w\-]+\.(?:pdf|docx|doc|txt|json)\b", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
 # Conversation history helper
 # ---------------------------------------------------------------------------
+
+
+def extract_recent_filename(state: Any) -> str | None:
+    """Return the most recently mentioned filename from conversation history.
+
+    Scans messages in reverse (newest first), skipping the current user message.
+    Used by search and analyze agents to enrich referential queries like
+    "в этом документе" → "document.pdf в этом документе".
+    """
+    messages: list = state.get("messages", [])
+    for msg in reversed(messages[:-1]):
+        content = getattr(msg, "content", "") or ""
+        matches = FILENAME_RE.findall(content)
+        if matches:
+            return matches[0]
+    return None
+
+
+def build_final_response(answer: str, combined_responses: list[str]) -> str:
+    """Merge multi-intent responses into a single final_response string.
+
+    When the supervisor detects multiple intents (e.g. search + verify), each
+    agent calls this to prepend the previous agent's output before its own
+    answer.  The separator line makes the boundary between results visible.
+
+    Args:
+        answer: The current agent's answer.
+        combined_responses: Answers accumulated from prior agents in this turn.
+
+    Returns:
+        Combined string, or just `answer` if there are no prior responses.
+    """
+    if combined_responses:
+        return "\n\n---\n\n".join(combined_responses) + "\n\n---\n\n" + answer
+    return answer
 
 
 def build_history_messages(state: Any, max_turns: int = 3) -> list["BaseMessage"]:
@@ -216,9 +267,6 @@ def close_all_clients() -> None:
 # Neo4j index bootstrap
 # ---------------------------------------------------------------------------
 
-_FULLTEXT_INDEX = "sectionText"
-
-
 def ensure_neo4j_fulltext_index() -> None:
     """Create Neo4j fulltext index + B-tree property indexes on startup.
 
@@ -232,6 +280,9 @@ def ensure_neo4j_fulltext_index() -> None:
     Non-fatal: if Neo4j is unreachable at startup the agent still works;
     CONTAINS fallback is used for fulltext, B-tree lookups degrade to full scans.
     """
+    from .config import get_settings
+    fulltext_index = get_settings().neo4j_fulltext_index
+
     _BTREE_INDEXES = [
         ("doc_doc_id",        "FOR (d:Document)   ON (d.doc_id)"),
         ("sec_section_id",    "FOR (s:Section)    ON (s.section_id)"),
@@ -247,16 +298,16 @@ def ensure_neo4j_fulltext_index() -> None:
             # ── Fulltext index ────────────────────────────────────────────────
             result = session.run(
                 "SHOW INDEXES WHERE name = $name",
-                name=_FULLTEXT_INDEX,
+                name=fulltext_index,
             )
             if result.single():
-                logger.debug("Neo4j fulltext index '%s' already exists.", _FULLTEXT_INDEX)
+                logger.debug("Neo4j fulltext index '%s' already exists.", fulltext_index)
             else:
                 session.run(
-                    f"CREATE FULLTEXT INDEX {_FULLTEXT_INDEX} IF NOT EXISTS "
+                    f"CREATE FULLTEXT INDEX {fulltext_index} IF NOT EXISTS "
                     f"FOR (s:Section) ON EACH [s.text_preview]"
                 )
-                logger.info("Neo4j fulltext index '%s' created.", _FULLTEXT_INDEX)
+                logger.info("Neo4j fulltext index '%s' created.", fulltext_index)
 
             # ── B-tree property indexes ───────────────────────────────────────
             existing_idx = {r["name"] for r in session.run("SHOW INDEXES YIELD name")}

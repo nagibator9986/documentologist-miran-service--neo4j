@@ -44,3 +44,8 @@ slowapi>=0.1.9
 # Streamlit UI
 streamlit>=1.32.0
 requests>=2.31.0
+
+# Observability — MLflow tracing, prompt registry, metrics
+# boto3 is required for MinIO/S3 artifact storage in MLflow
+mlflow>=2.14.0
+boto3>=1.34.0

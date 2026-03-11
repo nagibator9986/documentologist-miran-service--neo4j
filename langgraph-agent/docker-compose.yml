@@ -55,6 +55,11 @@ services:
       TEMPERATURE: ${TEMPERATURE:-0.1}
       MIN_RELEVANCE_SCORE: ${MIN_RELEVANCE_SCORE:-0.5}
 
+      # MLflow observability (disabled by default — set MLFLOW_ENABLED=true to activate)
+      MLFLOW_ENABLED: ${MLFLOW_ENABLED:-false}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-miran-agent}
+
     depends_on:
       qdrant:
         condition: service_healthy
@@ -63,6 +68,8 @@ services:
       redis:
         condition: service_healthy
       postgres:
+        condition: service_healthy
+      mlflow:
         condition: service_healthy
     volumes:
       - agent_exports:/exports
@@ -143,6 +150,65 @@ services:
       retries: 10
       start_period: 15s
 
+  # ── MLflow (observability — tracing, prompt registry, metrics) ─────────────
+  # Backend store: SQLite on a named volume (simple, no extra DB needed).
+  # Switch to PostgreSQL for production by overriding MLFLOW_BACKEND_STORE_URI.
+  # Artifact store: MinIO via S3-compatible API (reuses the existing minio service).
+  # UI: http://localhost:5000
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.15.1
+    container_name: mlflow
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5000:5000"
+    environment:
+      # Artifact store — MinIO bucket reachable inside Docker network
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set}
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      MLFLOW_S3_IGNORE_TLS: "true"
+    # boto3 is not included in the base MLflow image — install before starting the server.
+    command: >
+      bash -c "pip install boto3 --quiet --no-cache-dir &&
+      mlflow server
+      --backend-store-uri sqlite:////mlflow/store/mlflow.db
+      --artifacts-destination s3://mlflow-artifacts
+      --host 0.0.0.0
+      --port 5000"
+    volumes:
+      - mlflow_data:/mlflow/store
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── MinIO init — creates the mlflow-artifacts bucket on first run ────────────
+  # Runs once at startup, exits 0 when done.  Restarts are suppressed.
+  minio-init:
+    image: minio/mc:latest
+    # No container_name — Docker generates a unique name so repeated
+    # docker-compose up runs don't fail with "name already in use".
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set}
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 $${MINIO_ACCESS_KEY} $${MINIO_SECRET_KEY} &&
+        mc mb --ignore-existing local/mlflow-artifacts &&
+        echo 'MinIO: mlflow-artifacts bucket ready.'
+      "
+
   # ── MinIO (document exports) ────────────────────────────────────────────────
   minio:
     image: minio/minio:latest
@@ -171,3 +237,4 @@ volumes:
   postgres_data:
   minio_data:
   agent_exports:
+  mlflow_data:

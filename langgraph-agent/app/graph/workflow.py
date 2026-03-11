@@ -9,9 +9,9 @@ intents are processed the flow continues to `memory_save`.
 
 Flow:
     START -> memory_load -> supervisor
-          -> route_intent -> {search | verify | generate | analyze}
-          -> route_after_agent -> {advance_intent | memory_save}
-          -> (advance_intent) -> route_next_agent -> next_agent -> ...
+          -> [conditional edge: state["intent"]] -> {search | verify | generate | analyze | ingest}
+          -> [_route_after_agent] -> {advance_intent | memory_save}
+          -> (advance_intent) -> [_route_next_agent] -> next_agent -> ...
           -> memory_save -> END
 """
 from __future__ import annotations
@@ -25,8 +25,9 @@ from ..agents.generate_agent import generate_node
 from ..agents.ingest_agent import ingest_node
 from ..agents.memory_agent import memory_load_node, memory_save_node
 from ..agents.search_agent import search_node
-from ..agents.supervisor import classify_intent, route_intent
+from ..agents.supervisor import classify_intent
 from ..agents.verify_agent import verify_node
+from ..core.tracing import trace_node
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -104,13 +105,17 @@ def build_graph() -> StateGraph:
     builder = StateGraph(AgentState)
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
+    # Agent nodes are wrapped with trace_node so each execution becomes an
+    # MLflow child span under the top-level autolog trace for graph.invoke().
+    # Utility nodes (memory_load/save, advance_intent) are left unwrapped —
+    # they contain no LLM calls and their I/O latency is measured by autolog.
     builder.add_node("memory_load",    memory_load_node)
-    builder.add_node("supervisor",     classify_intent)
-    builder.add_node("ingest",         ingest_node)
-    builder.add_node("search",         search_node)
-    builder.add_node("verify",         verify_node)
-    builder.add_node("generate",       generate_node)
-    builder.add_node("analyze",        analyze_node)
+    builder.add_node("supervisor",     trace_node(classify_intent))
+    builder.add_node("ingest",         trace_node(ingest_node))
+    builder.add_node("search",         trace_node(search_node))
+    builder.add_node("verify",         trace_node(verify_node))
+    builder.add_node("generate",       trace_node(generate_node))
+    builder.add_node("analyze",        trace_node(analyze_node))
     builder.add_node("advance_intent", advance_intent_node)
     builder.add_node("memory_save",    memory_save_node)
 
@@ -119,9 +124,11 @@ def build_graph() -> StateGraph:
     builder.add_edge("memory_load", "supervisor")
 
     # ── Supervisor -> first agent (conditional) ────────────────────────────────
+    # The graph reads state["intent"] set by classify_intent and routes to the
+    # matching agent node.  Routing is the graph's responsibility, not an agent's.
     builder.add_conditional_edges(
         "supervisor",
-        route_intent,
+        lambda state: state.get("intent", "search"),
         {k: k for k in _AGENT_NODES},
     )
 

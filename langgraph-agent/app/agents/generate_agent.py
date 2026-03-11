@@ -1,10 +1,13 @@
-"""Generate Agent — document generation, DOCX/PDF export, law-based drafting.
+"""Generate Agent — legal document generation with DOCX/PDF export.
 
-Improvements:
-- Two-pass generation: plan -> draft -> legal validation pass
-- Uses s.history_turns from config
-- Uses invoke_with_retry for resilience
-- Multi-intent: prepends combined_responses from prior agents
+Pipeline:
+  1. _retrieve_legal_context — Qdrant search for applicable norms/templates
+  2. _plan_document          — LLM JSON: template type, title, sections, format
+  3. _generate_draft         — doc_generate tool: expand plan into full text
+  4. _validate_draft         — LLM review: add missing sections, fix wording
+  5. _export_document        — DOCX/PDF export + MinIO upload (non-fatal)
+  6. _minio_upload           — internal upload helper (non-fatal)
+  7. generate_node           — orchestrator
 """
 from __future__ import annotations
 
@@ -15,28 +18,29 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ..core.config import get_settings
 from ..core.llm import get_json_llm, get_llm, invoke_with_retry
-from ..core.utils import safe_parse_json
+from ..core.utils import build_final_response, safe_parse_json
 from ..graph.state import AgentState
+from ..prompts import GENERATE_PLAN, GENERATE_VALIDATE
 from ..tools.doc_generate import doc_generate, docx_export, pdf_export
 from ..tools.qdrant_search import qdrant_search
 
 logger = logging.getLogger(__name__)
 
 
+# ── MinIO upload helper ───────────────────────────────────────────────────────
+
 def _minio_upload(local_path: str, object_name: str) -> str | None:
     """Upload a local file to MinIO and return a presigned download URL. Non-fatal.
 
-    Upload uses the internal MINIO_ENDPOINT (works inside Docker network).
-    The presigned URL is generated using MINIO_PUBLIC_ENDPOINT (falls back to
-    MINIO_ENDPOINT) so external clients can actually reach the download link.
+    Upload uses the internal MINIO_ENDPOINT (works inside Docker).
+    The presigned URL uses MINIO_PUBLIC_ENDPOINT (falls back to MINIO_ENDPOINT)
+    so external clients can actually reach the download link.
     """
     try:
         from datetime import timedelta
         from minio import Minio
-        from ..core.config import get_settings as _gs
-        s = _gs()
+        s = get_settings()
 
-        # Upload via internal Docker address
         upload_client = Minio(
             s.minio_endpoint,
             access_key=s.minio_access_key,
@@ -47,7 +51,6 @@ def _minio_upload(local_path: str, object_name: str) -> str | None:
             upload_client.make_bucket(s.minio_bucket)
         upload_client.fput_object(s.minio_bucket, object_name, local_path)
 
-        # Presigned URL via public endpoint (accessible from outside Docker)
         public_endpoint = s.minio_public_endpoint or s.minio_endpoint
         url_client = Minio(
             public_endpoint,
@@ -55,64 +58,37 @@ def _minio_upload(local_path: str, object_name: str) -> str | None:
             secret_key=s.minio_secret_key,
             secure=s.minio_secure,
         )
-        url = url_client.presigned_get_object(
+        return url_client.presigned_get_object(
             s.minio_bucket, object_name, expires=timedelta(days=7)
         )
-        return url
     except Exception as exc:
         logger.warning("MinIO upload failed (non-critical): %s", exc)
         return None
 
 
-_PLAN_SYSTEM = """Ты — юридический ассистент по банковскому праву Казахстана.
-Сгенерируй план документа на основе запроса пользователя.
-КРИТИЧНО: ВСЕ текстовые значения должны быть ТОЛЬКО на русском языке.
-Никаких китайских, английских или других иностранных слов в тексте документа.
-Для стороны 1: "Кредитор" или "Банк"; для стороны 2: "Заёмщик" или "Клиент".
+# ── Stage 1: Legal context retrieval ─────────────────────────────────────────
 
-Выдай JSON:
-{
-  "template_type": "contract",
-  "title": "название документа на русском",
-  "context": {
-    "parties": "стороны на русском",
-    "subject": "предмет на русском",
-    "clauses": ["пункт 1 на русском", "пункт 2 на русском"],
-    "date": "дата",
-    "references": ["НПА 1", "НПА 2"]
-  },
-  "export_format": "docx",
-  "required_sections": ["Преамбула", "Стороны", "Предмет", "Обязательства", "Ответственность", "Реквизиты"]
-}"""
+def _retrieve_legal_context(query: str) -> tuple[list[dict], str]:
+    """Search Qdrant for templates and applicable norms.
 
-_VALIDATE_SYSTEM = """Ты — юридический эксперт по банковскому праву Казахстана.
-Проверь сгенерированный документ на полноту и соответствие нормам.
-Если чего-то не хватает — добавь это в документ (дополни текст).
-Верни ТОЛЬКО улучшенный финальный текст документа, без комментариев и объяснений.
-КРИТИЧНО: Документ должен быть ТОЛЬКО на русском языке.
-Никаких китайских иероглифов, английских слов или иностранных символов.
-Все имена, адреса и реквизиты — используй российско-казахстанские шаблоны (г. Алматы, ул. Абая и т.п.).
-"""
+    Returns:
+        (hits, legal_context_str)
+    """
+    hits = qdrant_search.invoke({"query": f"шаблон {query}", "limit": 5})
+    legal_context = "\n".join(f"- {h.get('content', '')[:300]}" for h in hits)
+    return hits, legal_context
 
 
-def generate_node(state: AgentState) -> AgentState:
-    """Generate a legal document using two-pass approach: plan -> draft -> validate."""
-    t_start = time.perf_counter()
-    s = get_settings()
-    query = state["user_query"]
+# ── Stage 2: Document structure planning ─────────────────────────────────────
 
-    # ── Pass 1: Retrieve legal context ───────────────────────────────────────
-    legal_hits = qdrant_search.invoke({"query": f"шаблон {query}", "limit": 5})
-    legal_context = "\n".join(f"- {h.get('content', '')[:300]}" for h in legal_hits)
-
-    # ── Pass 2: Plan document structure (JSON) ────────────────────────────────
+def _plan_document(query: str, legal_context: str) -> dict:
+    """Ask the LLM to produce a JSON document plan."""
     llm_json = get_json_llm(num_predict=1024)
-    raw_plan = invoke_with_retry(llm_json, [
-        SystemMessage(content=_PLAN_SYSTEM),
+    raw = invoke_with_retry(llm_json, [
+        SystemMessage(content=GENERATE_PLAN),
         HumanMessage(content=f"Запрос: {query}\n\nПрименимые нормы:\n{legal_context}"),
     ])
-
-    plan = safe_parse_json(raw_plan, {
+    return safe_parse_json(raw, {
         "template_type": "report",
         "title": "Документ",
         "context": {"subject": query},
@@ -120,47 +96,64 @@ def generate_node(state: AgentState) -> AgentState:
         "required_sections": [],
     })
 
-    # ── Pass 3: Generate document draft ──────────────────────────────────────
-    gen_context = plan.get("context", {"subject": query})
+
+# ── Stage 3: Draft generation ────────────────────────────────────────────────
+
+def _generate_draft(plan: dict, legal_context: str) -> str:
+    """Expand the document plan into a full draft using the doc_generate tool."""
+    gen_context = plan.get("context", {})
     required_sections = plan.get("required_sections", [])
+
     if isinstance(gen_context, dict) and legal_context:
         gen_context = {**gen_context, "legal_context": legal_context[:1500]}
     if isinstance(gen_context, dict) and required_sections:
         gen_context["required_sections"] = required_sections
 
-    doc_draft: str = doc_generate.invoke({
+    return doc_generate.invoke({
         "template_type": plan.get("template_type", "report"),
         "context": gen_context,
     })
 
-    # ── Pass 4: Legal validation & enrichment pass ────────────────────────────
-    # Ask LLM to review the draft and add missing sections / correct wording.
-    validation_prompt = (
+
+# ── Stage 4: Legal validation pass ───────────────────────────────────────────
+
+def _validate_draft(plan: dict, draft: str, legal_context: str) -> str:
+    """Ask the LLM to review the draft, add missing sections, fix wording."""
+    required_sections = plan.get("required_sections", [])
+    prompt = (
         f"Тип документа: {plan.get('title', 'Документ')}\n\n"
         f"Применимые нормы законодательства:\n{legal_context}\n\n"
         f"Обязательные разделы: {', '.join(required_sections) if required_sections else 'стандартные'}\n\n"
-        f"Черновик документа:\n{doc_draft}\n\n"
+        f"Черновик документа:\n{draft}\n\n"
         "Улучши документ: проверь наличие всех обязательных разделов, исправь юридические "
         "формулировки, добавь ссылки на применимые НПА. Верни финальный текст документа."
     )
-
     llm = get_llm(num_predict=2000)
-    doc_text = invoke_with_retry(llm, [
-        SystemMessage(content=_VALIDATE_SYSTEM),
-        HumanMessage(content=validation_prompt),
+    validated = invoke_with_retry(llm, [
+        SystemMessage(content=GENERATE_VALIDATE),
+        HumanMessage(content=prompt),
     ])
+    if not validated.strip():
+        logger.warning("generate: validation pass returned empty — using draft")
+        return draft
+    return validated
 
-    # Fallback: if validation pass returned empty, use the draft
-    if not doc_text.strip():
-        doc_text = doc_draft
-        logger.warning("generate_node: validation pass returned empty — using draft")
 
-    # ── Pass 5: Export ────────────────────────────────────────────────────────
-    export_path: str | None = None
+# ── Stage 5: Export and upload ────────────────────────────────────────────────
+
+def _export_document(doc_text: str, plan: dict) -> tuple[str | None, str]:
+    """Export to DOCX/PDF, upload to MinIO.
+
+    Returns:
+        (export_path_or_url, export_format)
+    """
     export_format = plan.get("export_format", "text")
     safe_title = "".join(
-        c if c.isalnum() or c in "-_ " else "_" for c in plan.get("title", "document")
+        c if c.isalnum() or c in "-_ " else "_"
+        for c in plan.get("title", "document")
     ).strip()[:60] or "document"
+
+    export_path: str | None = None
 
     if export_format == "docx":
         try:
@@ -175,16 +168,27 @@ def generate_node(state: AgentState) -> AgentState:
         except Exception as exc:
             logger.warning("PDF export failed: %s", exc)
 
+    return export_path, export_format
+
+
+# ── Graph entry point ─────────────────────────────────────────────────────────
+
+def generate_node(state: AgentState) -> AgentState:
+    """Document generation node: plan → draft → validate → export."""
+    t_start = time.perf_counter()
+    query = state["user_query"]
+
+    legal_hits, legal_context = _retrieve_legal_context(query)
+    plan = _plan_document(query, legal_context)
+    draft = _generate_draft(plan, legal_context)
+    doc_text = _validate_draft(plan, draft, legal_context)
+    export_path, export_format = _export_document(doc_text, plan)
+
     summary = f"**{plan.get('title', 'Документ')}**\n\n{doc_text[:800]}{'...' if len(doc_text) > 800 else ''}"
     if export_path:
         summary += f"\n\nФайл: `{export_path}`"
 
-    # Multi-intent: prepend previous agents' responses
-    combined_prev = state.get("combined_responses") or []
-    if combined_prev:
-        final_response = "\n\n---\n\n".join(combined_prev) + "\n\n---\n\n" + summary
-    else:
-        final_response = summary
+    final_response = build_final_response(summary, state.get("combined_responses") or [])
 
     elapsed = time.perf_counter() - t_start
     logger.info(

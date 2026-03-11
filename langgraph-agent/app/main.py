@@ -20,6 +20,7 @@ from .api.v1.ingest import router as ingest_router
 from .api.v1.sessions import router as sessions_router
 from .core.config import get_settings
 from .core.rate_limit import limiter
+from .core.tracing import register_all_prompts, setup_mlflow
 from .core.utils import close_all_clients, ensure_neo4j_fulltext_index
 from .tools.session_memory import pg_ensure_schema_sync, pg_shutdown
 
@@ -52,6 +53,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Ensure Neo4j fulltext index exists (non-fatal: graph search falls back to CONTAINS)
     ensure_neo4j_fulltext_index()
+
+    # MLflow: configure tracking + autolog, then snapshot prompt versions.
+    # Both calls are non-fatal — app starts normally if MLflow is unreachable.
+    setup_mlflow(s)
+    register_all_prompts(s)
 
     yield
 

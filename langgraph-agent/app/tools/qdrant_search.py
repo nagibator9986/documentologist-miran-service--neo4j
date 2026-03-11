@@ -42,21 +42,22 @@ def qdrant_search(
 
     vector = _embed_query(query)
 
+    named_vector = s.qdrant_named_vector
     # Try named vector first (dual-vector collections from bank_knowledge)
     try:
         response = client.query_points(
             collection_name=col,
             query=vector,
-            using="q_vec",
+            using=named_vector,
             limit=limit,
             offset=offset,
             with_payload=True,
         )
         results = response.points
-        logger.debug("qdrant_search used named vector 'q_vec' for collection '%s'", col)
+        logger.debug("qdrant_search used named vector '%s' for collection '%s'", named_vector, col)
     except (UnexpectedResponse, Exception) as exc:
         # Named vector not available — fall back to default vector
-        logger.debug("qdrant_search 'q_vec' unavailable (%s), trying default vector", type(exc).__name__)
+        logger.debug("qdrant_search '%s' unavailable (%s), trying default vector", named_vector, type(exc).__name__)
         try:
             response = client.query_points(
                 collection_name=col,

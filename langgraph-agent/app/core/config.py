@@ -106,10 +106,52 @@ class Settings(BaseSettings):
     # Max characters of content shown in citation preview
     citation_preview_max_len: int = 200
 
+    # ── Reranker ──────────────────────────────────────────────────────
+    # Primary multilingual cross-encoder (mMARCO, 13 languages incl. Russian)
+    reranker_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    # Fallback cross-encoder if primary fails to load
+    reranker_fallback_model: str = "cross-encoder/ms-marco-MiniLM-L6-v2"
+    # Max characters of content fed to the cross-encoder per chunk
+    # 1024 chars ≈ 200-250 tokens; legal paragraphs often need full context
+    reranker_max_content: int = 1024
+
+    # ── Search pipeline tuning ────────────────────────────────────────
+    # Minimum sigmoid-normalised rerank score to consider context reliable
+    search_min_confidence: float = 0.25
+    # Seconds before parallel graph-enrichment step times out
+    graph_enrichment_timeout: float = 8.0
+    # num_predict for supervisor intent LLM call (only need 1-2 words out)
+    supervisor_num_predict: int = 32
+    # Char length above which the user query is treated as pasted document text
+    verify_pasted_doc_threshold: int = 300
+
+    # ── Qdrant vector schema ──────────────────────────────────────────
+    # Named vector used in dual-vector Qdrant collections (set by the indexer)
+    qdrant_named_vector: str = "q_vec"
+
+    # ── Neo4j index names ─────────────────────────────────────────────
+    # Fulltext index on Section.text_preview (created at startup)
+    neo4j_fulltext_index: str = "sectionText"
+
+    # ── PostgreSQL connection pool ────────────────────────────────────
+    pg_pool_min_size: int = 1
+    pg_pool_max_size: int = 5
+    # Thread pool workers for running async PG calls from sync context
+    pg_thread_workers: int = 2
+
     # ── Integration: OCR Service ──────────────────────────────────────
     # Base URL of the Surya OCR service (first step in the pipeline).
     # Example: http://ocr-api:8000
     ocr_service_url: str = "http://localhost:8000"
+
+    # ── MLflow Observability ──────────────────────────────────────────
+    # Set MLFLOW_ENABLED=true in .env to enable tracing.
+    # When false all tracing code is a no-op — zero overhead.
+    mlflow_enabled: bool = False
+    # MLflow tracking server URL (docker-compose: http://mlflow:5000)
+    mlflow_tracking_uri: str = "http://localhost:5000"
+    # Experiment groups all runs for this service together in the UI
+    mlflow_experiment_name: str = "miran-agent"
 
 
 @lru_cache

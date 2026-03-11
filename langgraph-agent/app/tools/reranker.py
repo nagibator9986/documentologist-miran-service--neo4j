@@ -16,15 +16,9 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from ..core.config import get_settings
+
 logger = logging.getLogger(__name__)
-
-# Multilingual mMARCO cross-encoder — trained on 13 languages including Russian.
-_MODEL_NAME = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
-_FALLBACK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L6-v2"
-
-# Max characters of document content fed to the cross-encoder.
-# 1024 chars ≈ 200-250 tokens; legal paragraphs often need full context.
-_CONTENT_MAX_CHARS = 1024
 
 
 def _sigmoid(x: float) -> float:
@@ -37,7 +31,8 @@ def _get_cross_encoder():
     """Load cross-encoder once and cache it in memory. Try multilingual first."""
     from sentence_transformers import CrossEncoder
 
-    for model_name in (_MODEL_NAME, _FALLBACK_MODEL_NAME):
+    s = get_settings()
+    for model_name in (s.reranker_model, s.reranker_fallback_model):
         try:
             logger.info("Loading cross-encoder model %s ...", model_name)
             model = CrossEncoder(model_name, max_length=512)
@@ -70,7 +65,7 @@ def reranker(query: str, documents: list[dict[str, Any]], top_k: int = 5) -> lis
         model = _get_cross_encoder()
         # 1024 chars instead of 512 — critical for long legal paragraphs where
         # the relevant sentence may be in the second half of a paragraph.
-        pairs = [(query, doc.get("content", "")[:_CONTENT_MAX_CHARS]) for doc in documents]
+        pairs = [(query, doc.get("content", "")[:get_settings().reranker_max_content]) for doc in documents]
         raw_scores: list[float] = model.predict(pairs).tolist()
 
         scored = sorted(
