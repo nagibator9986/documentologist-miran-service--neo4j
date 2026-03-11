@@ -21,7 +21,7 @@ from ..core.utils import build_final_response, build_history_messages, safe_pars
 from ..graph.state import AgentState
 from ..prompts import VERIFY_COMPLIANCE
 from ..tools.neo4j_query import graph_obligation_search, graph_section_search
-from ..tools.qdrant_search import qdrant_search
+from ..tools.qdrant_search import qdrant_scroll_by_doc_ids, qdrant_search
 
 logger = logging.getLogger(__name__)
 
@@ -39,36 +39,10 @@ def _fetch_document_content(state: AgentState, query: str) -> str:
 
     doc_ids = state.get("document_ids") or []
     if doc_ids:
-        from ..core.utils import get_qdrant_client
-        from qdrant_client import models as qmodels
-        client = get_qdrant_client()
-        try:
-            chunks: list[str] = []
-            for doc_id in doc_ids[:3]:
-                records, _ = client.scroll(
-                    collection_name=s.qdrant_collection,
-                    scroll_filter=qmodels.Filter(
-                        must=[qmodels.FieldCondition(
-                            key="meta_json",
-                            match=qmodels.MatchText(text=doc_id),
-                        )]
-                    ),
-                    limit=10,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-                for r in records:
-                    payload = r.payload or {}
-                    text = payload.get("answer") or payload.get("text", "")
-                    if text:
-                        chunks.append(text[:s.content_snippet_max_len])
-            if chunks:
-                logger.info(
-                    "verify: fetched %d chunks for document_ids=%s", len(chunks), doc_ids
-                )
-                return "\n\n".join(chunks)
-        except Exception as exc:
-            logger.warning("verify: failed to fetch document_ids from Qdrant: %s", exc)
+        chunks = qdrant_scroll_by_doc_ids(doc_ids)
+        if chunks:
+            logger.info("verify: fetched %d chunks for document_ids=%s", len(chunks), doc_ids)
+            return "\n\n".join(chunks)
 
     if len(query) > s.verify_pasted_doc_threshold:
         logger.info("verify: using long query (%d chars) as document text", len(query))

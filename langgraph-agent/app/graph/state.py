@@ -8,6 +8,19 @@ from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 
+class RetrievalMetrics(TypedDict, total=False):
+    """Structured observability payload set by retrieval nodes."""
+    node: str                  # which agent produced these metrics
+    elapsed_s: float           # wall-clock seconds for the node
+    merged_hits: int           # total chunks after vector+BM25 merge
+    graph_hits: int            # chunks added from Neo4j
+    best_rerank_score: float   # top cross-encoder sigmoid score
+    is_exact_search: bool      # True when phrase-match query was used
+    query_expanded: bool       # True when query was rewritten by LLM
+    doc_content_len: int       # characters of document content verified
+    risk_score: int            # verify_node compliance risk (0-10)
+
+
 class AgentState(TypedDict):
     """Shared state passed between all nodes in the graph."""
 
@@ -54,4 +67,4 @@ class AgentState(TypedDict):
 
     # ── Observability ─────────────────────────────────────────────────
     # Structured retrieval metrics for debugging and monitoring
-    retrieval_metrics: dict[str, Any]
+    retrieval_metrics: RetrievalMetrics

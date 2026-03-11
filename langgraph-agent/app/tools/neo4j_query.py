@@ -70,15 +70,19 @@ def law_lookup(law_id: str) -> dict[str, Any]:
         OPTIONAL MATCH (l)-[:HAS_ARTICLE]->(a:Article)
         RETURN l, collect(a) AS articles
     """
-    driver = get_neo4j_driver()
-    with driver.session() as session:
-        result = session.run(cypher, law_id=law_id)
-        record = result.single()
-        if not record:
-            return {"error": f"Law {law_id!r} not found"}
-        law_node = dict(record["l"])
-        articles = [dict(a) for a in record["articles"] if a]
-        return {"law": law_node, "articles": articles}
+    try:
+        driver = get_neo4j_driver()
+        with driver.session() as session:
+            result = session.run(cypher, law_id=law_id)
+            record = result.single()
+            if not record:
+                return {"error": f"Law {law_id!r} not found"}
+            law_node = dict(record["l"])
+            articles = [dict(a) for a in record["articles"] if a]
+            return {"law": law_node, "articles": articles}
+    except Exception as exc:
+        logger.error("law_lookup(%r) failed: %s", law_id, exc)
+        return {"error": str(exc)}
 
 
 @tool

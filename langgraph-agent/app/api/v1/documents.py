@@ -5,10 +5,11 @@ import json
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from ...core.config import get_settings
+from ...core.rate_limit import limiter
 from ...core.utils import get_qdrant_client
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,8 @@ def _extract_meta(payload: dict) -> dict:
 
 
 @router.get("/", summary="List all indexed documents")
-def list_documents() -> dict:
+@limiter.limit("20/minute")
+def list_documents(request: Request) -> dict:
     """Return list of unique source documents indexed in Qdrant."""
     s = get_settings()
     client = get_qdrant_client()
@@ -93,7 +95,8 @@ def list_documents() -> dict:
 
 
 @router.get("/search", summary="Find documents containing exact text")
-def search_documents(text: str, limit: int = 5) -> dict:
+@limiter.limit("30/minute")
+def search_documents(request: Request, text: str, limit: int = 5) -> dict:
     """Return documents (with page/chunk info) that contain the exact text substring."""
     from ...tools.qdrant_search import qdrant_text_search
 
@@ -166,7 +169,8 @@ def _extract_text_from_uploads(filename: str) -> str | None:
 
 
 @router.get("/{filename}/download", summary="Download document as extracted text")
-def download_document(filename: str):
+@limiter.limit("20/minute")
+def download_document(request: Request, filename: str):
     """Download document content extracted from Surya OCR.
 
     Since only Surya JSON files are stored (not original PDFs), this endpoint
@@ -174,22 +178,34 @@ def download_document(filename: str):
     """
     from fastapi.responses import Response
 
-    # Security: prevent path traversal
+    # Security: strip path components and prevent traversal / symlink escapes
     safe_name = Path(filename).name
-    if not safe_name or safe_name != filename:
+    if not safe_name or safe_name != filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    if not _get_upload_dir().exists():
+    upload_dir = _get_upload_dir()
+    if not upload_dir.exists():
         raise HTTPException(status_code=404, detail="Uploads directory not found")
 
+    upload_root = upload_dir.resolve()
+
+    def _safe_path(p: Path) -> Path:
+        """Resolve and verify the path stays inside the upload directory."""
+        resolved = p.resolve()
+        if not str(resolved).startswith(str(upload_root)):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        return resolved
+
     # 1. Try exact file match (e.g. if someone stored the PDF directly)
-    exact = _get_upload_dir() / safe_name
+    exact = upload_dir / safe_name
     if exact.exists():
+        _safe_path(exact)
         return FileResponse(path=str(exact), filename=safe_name)
 
-    candidates = [f for f in _get_upload_dir().iterdir() if f.is_file() and f.name.endswith(safe_name)]
+    candidates = [f for f in upload_dir.iterdir() if f.is_file() and f.name.endswith(safe_name)]
     if candidates:
         best = max(candidates, key=lambda f: f.stat().st_mtime)
+        _safe_path(best)
         return FileResponse(path=str(best), filename=safe_name)
 
     # 2. Extract text from Surya JSON — this is the normal case

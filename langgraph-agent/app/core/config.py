@@ -12,6 +12,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",  # .env may have vars for other services (docker-compose etc.)
     )
 
     # ── App ───────────────────────────────────────────────────────────
@@ -143,6 +144,29 @@ class Settings(BaseSettings):
     # Base URL of the Surya OCR service (first step in the pipeline).
     # Example: http://ocr-api:8000
     ocr_service_url: str = "http://localhost:8000"
+
+    # ── File upload limits ────────────────────────────────────────────
+    # Maximum file size accepted by POST /api/v1/ingest (in megabytes)
+    max_upload_size_mb: int = 50
+
+    # ── Qdrant scan limits ────────────────────────────────────────────
+    # Maximum number of 200-record scroll batches for full-collection scan
+    # (used by qdrant_text_search fallback and list_documents endpoint)
+    qdrant_max_scan_batches: int = 50
+
+    # ── SSE streaming ─────────────────────────────────────────────────
+    # Number of words per SSE token event when streaming the final response
+    sse_word_chunk_size: int = 6
+
+    # ── Reranking ─────────────────────────────────────────────────────
+    # Multiplier applied to rerank_top_k to form the candidate pool size
+    # before cross-encoder scoring (higher = better recall, more CPU)
+    rerank_candidate_multiplier: int = 2
+
+    # ── Graph query thread pool ───────────────────────────────────────
+    # Worker threads for parallel Neo4j queries inside _retrieve_graph.
+    # Shared pool — created once, reused across all requests.
+    graph_pool_workers: int = 5
 
     # ── MLflow Observability ──────────────────────────────────────────
     # Set MLFLOW_ENABLED=true in .env to enable tracing.

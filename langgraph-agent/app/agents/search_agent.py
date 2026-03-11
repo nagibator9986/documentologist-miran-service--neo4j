@@ -21,6 +21,7 @@ from __future__ import annotations
 import json as _json
 import logging
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -47,6 +48,26 @@ from ..tools.qdrant_search import qdrant_search, qdrant_text_search
 from ..tools.reranker import reranker
 
 logger = logging.getLogger(__name__)
+
+# ── Module-level thread pool for parallel Neo4j queries ──────────────────────
+# Lazy singleton with double-checked locking — created once, reused per request.
+# Prevents unbounded thread creation when many requests arrive simultaneously.
+
+_graph_pool: ThreadPoolExecutor | None = None
+_graph_pool_lock = threading.Lock()
+
+
+def _get_graph_pool() -> ThreadPoolExecutor:
+    global _graph_pool
+    if _graph_pool is None:
+        with _graph_pool_lock:
+            if _graph_pool is None:
+                _graph_pool = ThreadPoolExecutor(
+                    max_workers=get_settings().graph_pool_workers,
+                    thread_name_prefix="graph-query",
+                )
+    return _graph_pool
+
 
 # ── Domain-specific regex patterns ───────────────────────────────────────────
 
@@ -317,20 +338,20 @@ def _retrieve_graph(query: str, s: Settings) -> dict[str, list[dict]]:
         "laws": _laws,
     }
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(fn): name for name, fn in task_map.items()}
-        try:
-            for future in as_completed(futures, timeout=s.graph_enrichment_timeout):
-                name = futures[future]
-                try:
-                    results[name] = future.result()
-                except Exception as exc:
-                    logger.warning("graph_%s lookup failed: %s", name, exc)
-        except TimeoutError:
-            logger.warning(
-                "search: graph enrichment timeout (%.1fs) — using partial results",
-                s.graph_enrichment_timeout,
-            )
+    pool = _get_graph_pool()
+    futures = {pool.submit(fn): name for name, fn in task_map.items()}
+    try:
+        for future in as_completed(futures, timeout=s.graph_enrichment_timeout):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                logger.warning("graph_%s lookup failed: %s", name, exc)
+    except TimeoutError:
+        logger.warning(
+            "search: graph enrichment timeout (%.1fs) — using partial results",
+            s.graph_enrichment_timeout,
+        )
 
     return results
 

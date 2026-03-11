@@ -22,6 +22,7 @@ import time
 
 from langchain_core.messages import AIMessage
 
+from ..core.utils import build_final_response
 from ..graph.state import AgentState
 from ..tools.ocr_client import ocr_check_status, ocr_list_documents
 
@@ -142,11 +143,7 @@ def ingest_node(state: AgentState) -> AgentState:
     elapsed = time.perf_counter() - t_start
     logger.info("ingest_node: elapsed=%.2fs doc_id=%s", elapsed, doc_id or "none")
 
-    combined_prev = state.get("combined_responses") or []
-    final_response = (
-        "\n\n---\n\n".join(combined_prev) + "\n\n---\n\n" + response
-        if combined_prev else response
-    )
+    final_response = build_final_response(response, state.get("combined_responses") or [])
 
     return {
         **state,

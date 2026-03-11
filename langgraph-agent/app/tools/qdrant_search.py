@@ -90,6 +90,54 @@ def qdrant_search(
     return hits
 
 
+def qdrant_scroll_by_doc_ids(
+    doc_ids: list[str],
+    max_chunks_per_doc: int = 10,
+) -> list[str]:
+    """Fetch text chunks from Qdrant filtered by doc_id values in meta_json.
+
+    Keeps qdrant_client.models inside the tool layer so callers (agents)
+    don't need to import infrastructure types directly.
+
+    Args:
+        doc_ids: Document identifiers to filter on (up to 3 used).
+        max_chunks_per_doc: Max chunks fetched per doc_id.
+
+    Returns:
+        List of text strings (content snippets) for all matching chunks.
+    """
+    from qdrant_client import models as qmodels
+
+    s = get_settings()
+    client = get_qdrant_client()
+    chunks: list[str] = []
+
+    for doc_id in doc_ids[:3]:
+        try:
+            records, _ = client.scroll(
+                collection_name=s.qdrant_collection,
+                scroll_filter=qmodels.Filter(
+                    must=[qmodels.FieldCondition(
+                        key="meta_json",
+                        match=qmodels.MatchText(text=doc_id),
+                    )]
+                ),
+                limit=max_chunks_per_doc,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for r in records:
+                payload = r.payload or {}
+                text = payload.get("answer") or payload.get("text", "")
+                if text:
+                    chunks.append(text[:s.content_snippet_max_len])
+        except Exception as exc:
+            logger.warning("qdrant_scroll_by_doc_ids(%r) failed: %s", doc_id, exc)
+
+    logger.debug("qdrant_scroll_by_doc_ids(%s) → %d chunks", doc_ids, len(chunks))
+    return chunks
+
+
 @tool
 def qdrant_text_search(
     text: str,
