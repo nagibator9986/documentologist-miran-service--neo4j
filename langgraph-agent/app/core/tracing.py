@@ -133,13 +133,14 @@ def trace_node(fn: F) -> F:
                 if metrics:
                     _log_numeric_metrics(metrics)
 
-                span.set_outputs({
-                    "intent":      (result or {}).get("intent", ""),
-                    "elapsed_s":   metrics.get("elapsed_s"),
-                    "has_context": int(metrics.get("has_context", False))
-                    if isinstance(metrics.get("has_context"), bool)
-                    else metrics.get("has_context"),
-                })
+                outputs: dict[str, Any] = {
+                    "intent": (result or {}).get("intent", ""),
+                }
+                if (elapsed := metrics.get("elapsed_s")) is not None:
+                    outputs["elapsed_s"] = elapsed
+                if (has_ctx := metrics.get("has_context")) is not None:
+                    outputs["has_context"] = int(has_ctx) if isinstance(has_ctx, bool) else has_ctx
+                span.set_outputs(outputs)
 
                 return result
 
