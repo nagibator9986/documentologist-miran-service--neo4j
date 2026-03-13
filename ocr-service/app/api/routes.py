@@ -254,17 +254,37 @@ async def get_status(
     doc_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Return processing status for a document."""
+    """Return processing status for a document, plus downstream indexing status if available."""
     svc = DocumentService(db)
     doc = await svc.find_by_id(doc_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Документ не найден.")
+
+    indexing_status: str | None = None
+    indexing_message: str | None = None
+
+    # Optionally enrich with bank_knowledge indexer status
+    if settings.indexer_status_url:
+        import httpx
+
+        status_url = f"{settings.indexer_status_url.rstrip('/')}/{doc_id}/status"
+        try:
+            resp = httpx.get(status_url, timeout=3.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                indexing_status = data.get("status")
+                indexing_message = data.get("message") or None
+        except Exception as exc:  # pragma: no cover - network failures are non-critical
+            logger.warning(f"Failed to fetch indexing status from {status_url}: {exc}")
+
     return StatusResponse(
         doc_id=doc.id,
         status=doc.status,
         filename=doc.filename,
         result_path=doc.result_path,
         error_message=doc.error_message,
+        indexing_status=indexing_status,
+        indexing_message=indexing_message,
     )
 
 

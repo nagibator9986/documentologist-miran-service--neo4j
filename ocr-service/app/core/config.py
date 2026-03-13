@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     # Пример: http://bank-knowledge:8002/api/v1/index
     # Оставьте пустым чтобы отключить автоиндексацию.
     indexer_webhook_url: str = ""
+    # Base URL for indexing status checks. When configured, the status endpoint
+    # will be called as: {indexer_status_url.rstrip('/')}/{doc_id}/status
+    # Example (matching the webhook service above):
+    #   INDEXER_STATUS_URL=http://bank-knowledge:8002/api/v1/index
+    indexer_status_url: str = ""
 
     @field_validator("cors_origins", mode="before")
     @classmethod

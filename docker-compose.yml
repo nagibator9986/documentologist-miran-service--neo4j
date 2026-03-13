@@ -194,6 +194,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
       INDEXER_WEBHOOK_URL: "http://bank-knowledge:8002/api/v1/index"
+      INDEXER_STATUS_URL: "http://bank-knowledge:8002/api/v1/index"
     depends_on:
       postgres:
         condition: service_healthy
@@ -224,6 +225,7 @@ services:
       OCR_RETRY_DELAY_SECONDS: ${OCR_RETRY_DELAY_SECONDS:-60}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       INDEXER_WEBHOOK_URL: "http://bank-knowledge:8002/api/v1/index"
+      INDEXER_STATUS_URL: "http://bank-knowledge:8002/api/v1/index"
     depends_on:
       postgres:
         condition: service_healthy
