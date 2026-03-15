@@ -7,12 +7,10 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from ..core.config import get_settings
 from ..core.utils import get_neo4j_driver
 
 logger = logging.getLogger(__name__)
-
-# Lucene fulltext index name (created by scripts/setup_neo4j.py)
-_FULLTEXT_INDEX = "sectionText"
 
 # Traversal depth limits to prevent runaway queries
 _MIN_DEPTH = 1
@@ -23,6 +21,27 @@ _ALLOWED_REL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ_")
 
 # Lucene special characters that break fulltext queries when unescaped
 _LUCENE_SPECIAL_RE = re.compile(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)')
+
+# Safe Cypher identifier: must start with a letter, contain only [a-zA-Z0-9_]
+_SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
+
+
+def _validate_identifier(name: str, label: str = "identifier") -> str:
+    """Validate that *name* is a safe Cypher identifier before injecting into queries.
+
+    Neo4j index/procedure names are placed directly in Cypher strings (they cannot
+    be parameterised).  Restricting them to ``[a-zA-Z][a-zA-Z0-9_]*`` eliminates
+    injection risk while covering every valid Neo4j identifier.
+
+    Raises:
+        ValueError: if *name* is empty or contains unsafe characters.
+    """
+    if not name or not _SAFE_IDENTIFIER_RE.match(name):
+        raise ValueError(
+            f"Unsafe {label} {name!r} — must start with a letter and contain only "
+            "[a-zA-Z0-9_].  Check neo4j_fulltext_index in config/.env."
+        )
+    return name
 
 
 def _escape_lucene(text: str) -> str:
@@ -72,15 +91,19 @@ def law_lookup(law_id: str) -> dict[str, Any]:
         OPTIONAL MATCH (l)-[:HAS_ARTICLE]->(a:Article)
         RETURN l, collect(a) AS articles
     """
-    driver = get_neo4j_driver()
-    with driver.session() as session:
-        result = session.run(cypher, law_id=law_id)
-        record = result.single()
-        if not record:
-            return {"error": f"Law {law_id!r} not found"}
-        law_node = dict(record["l"])
-        articles = [dict(a) for a in record["articles"] if a]
-        return {"law": law_node, "articles": articles}
+    try:
+        driver = get_neo4j_driver()
+        with driver.session() as session:
+            result = session.run(cypher, law_id=law_id)
+            record = result.single()
+            if not record:
+                return {"error": f"Law {law_id!r} not found"}
+            law_node = dict(record["l"])
+            articles = [dict(a) for a in record["articles"] if a]
+            return {"law": law_node, "articles": articles}
+    except Exception as exc:
+        logger.error("law_lookup(%r) failed: %s", law_id, exc)
+        return {"error": str(exc)}
 
 
 @tool
@@ -100,8 +123,12 @@ def graph_section_search(keywords: str, limit: int = 5) -> list[dict[str, Any]]:
         try:
             # Escape Lucene special chars to prevent query parse errors
             safe_kw = _escape_lucene(keywords)
+            # _validate_identifier raises ValueError on unsafe names, preventing injection
+            fulltext_index = _validate_identifier(
+                get_settings().neo4j_fulltext_index, "neo4j_fulltext_index"
+            )
             cypher = f"""
-                CALL db.index.fulltext.queryNodes('{_FULLTEXT_INDEX}', $kw)
+                CALL db.index.fulltext.queryNodes('{fulltext_index}', $kw)
                 YIELD node AS s, score
                 OPTIONAL MATCH (d:Document)-[:CONTAINS]->(s)
                 OPTIONAL MATCH (s)-[:HAS_ARTICLE]->(a:Article)

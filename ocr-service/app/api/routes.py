@@ -8,10 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,13 +28,26 @@ from app.schemas.document import (
     StatusResponse,
     UploadResponse,
 )
-from app.services.documents import DocumentService
+from app.services.documents import DocumentService, InvalidCursorError
 from app.services.hasher import compute_sha256
 from app.services.metrics import uploads_total
 from app.services.storage import get_minio_service
 
 router = APIRouter(tags=["Documents"])
 settings = get_settings()
+
+
+def _make_limiter() -> Limiter:
+    """Build a SlowAPI limiter backed by Redis when REDIS_URL is configured,
+    otherwise fall back to in-memory storage (suitable for single-replica only).
+    """
+    if settings.redis_url:
+        return Limiter(key_func=get_remote_address, storage_uri=settings.redis_url)
+    return Limiter(key_func=get_remote_address)
+
+
+# Rate limiter — shared instance, registered on the app in main.py
+limiter = _make_limiter()
 
 # ── File-type validation ──────────────────────────────────────────
 
@@ -114,7 +129,9 @@ class BulkUploadResponse(BaseModel):
 # ── Endpoints ────────────────────────────────────────────────
 
 @router.post("/upload", response_model=UploadResponse, status_code=201)
+@limiter.limit("30/minute")
 async def upload_document(
+    request: Request,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
@@ -126,23 +143,23 @@ async def upload_document(
       The background worker picks it up automatically via polling.
     """
     if not file.filename:
-        raise HTTPException(status_code=400, detail="Filename is required.")
+        raise HTTPException(status_code=400, detail="Имя файла обязательно.")
 
     try:
         file.file.seek(0, 2)
         file_size = file.file.tell()
         file.file.seek(0)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail="Unable to read uploaded file.") from exc
+        raise HTTPException(status_code=400, detail="Не удалось прочитать загруженный файл.") from exc
 
     if file_size == 0:
-        raise HTTPException(status_code=400, detail="Empty file.")
+        raise HTTPException(status_code=400, detail="Файл пустой.")
 
     max_size_bytes = settings.max_upload_size_mb * 1024 * 1024
     if file_size > max_size_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"File too large. Max size is {settings.max_upload_size_mb} MB.",
+            detail=f"Файл слишком большой. Максимальный размер: {settings.max_upload_size_mb} МБ.",
         )
 
     # ── MIME / magic-bytes validation ────────────────────────
@@ -182,7 +199,7 @@ async def upload_document(
         await db.rollback()
         existing = await svc.find_by_hash(file_hash)
         if existing is None:
-            raise HTTPException(status_code=409, detail="Duplicate upload conflict.")
+            raise HTTPException(status_code=409, detail="Конфликт: дублирующаяся загрузка.")
         await svc.mark_duplicate(existing)
         await db.commit()
         uploads_total.labels(is_duplicate="true").inc()
@@ -215,6 +232,7 @@ async def upload_document(
         raise HTTPException(status_code=500, detail="Ошибка сохранения метаданных документа.")
 
     uploads_total.labels(is_duplicate="false").inc()
+    logger.info(f"[AUDIT] Новый документ загружен: id={doc.id} hash={file_hash} file={file.filename}")
     return UploadResponse(
         doc_id=doc.id,
         status=doc.status,
@@ -224,7 +242,9 @@ async def upload_document(
 
 
 @router.post("/upload/bulk", response_model=BulkUploadResponse, status_code=207)
+@limiter.limit("10/minute")
 async def upload_documents_bulk(
+    request: Request,
     files: List[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db),
 ):
@@ -239,7 +259,7 @@ async def upload_documents_bulk(
     for file in files:
         try:
             # Вызываем функцию одиночной загрузки напрямую
-            res = await upload_document(file=file, db=db)
+            res = await upload_document(request=request, file=file, db=db)
             successful.append(res)
         except HTTPException as e:
             failed.append({"filename": file.filename, "error": str(e.detail)})
@@ -254,17 +274,38 @@ async def get_status(
     doc_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Return processing status for a document."""
+    """Return processing status for a document, plus downstream indexing status if available."""
     svc = DocumentService(db)
     doc = await svc.find_by_id(doc_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="Документ не найден.")
+
+    indexing_status: str | None = None
+    indexing_message: str | None = None
+
+    # Optionally enrich with bank_knowledge indexer status
+    if settings.indexer_status_url:
+        import httpx
+
+        status_url = f"{settings.indexer_status_url.rstrip('/')}/{doc_id}/status"
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(status_url, timeout=3.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                indexing_status = data.get("status")
+                indexing_message = data.get("message") or None
+        except Exception as exc:  # pragma: no cover - network failures are non-critical
+            logger.warning(f"Failed to fetch indexing status from {status_url}: {exc}")
+
     return StatusResponse(
         doc_id=doc.id,
         status=doc.status,
         filename=doc.filename,
         result_path=doc.result_path,
         error_message=doc.error_message,
+        indexing_status=indexing_status,
+        indexing_message=indexing_message,
     )
 
 
@@ -306,20 +347,55 @@ async def list_documents(
     Omit `cursor` (or set to null) to start from the first page.
     """
     svc = DocumentService(db)
-    docs, total, next_cursor = await svc.list_documents(
-        cursor=cursor,
-        limit=limit,
-        latest_only=latest_only,
-        status=status,
-        filename=filename,
-        created_after=created_after,
-        created_before=created_before,
-    )
+    try:
+        docs, total, next_cursor = await svc.list_documents(
+            cursor=cursor,
+            limit=limit,
+            latest_only=latest_only,
+            status=status,
+            filename=filename,
+            created_after=created_after,
+            created_before=created_before,
+        )
+    except InvalidCursorError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return DocumentListResponse(
         total=total,
         documents=[DocumentResponse.model_validate(d) for d in docs],
         next_cursor=next_cursor,
     )
+
+
+@router.delete("/documents/{doc_id}", status_code=204)
+async def delete_document(
+    doc_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Удалить документ и все связанные файлы в MinIO.
+
+    Выполняет каскадное удаление: сначала запись в БД, затем
+    исходный файл и результат OCR из MinIO. Возвращает 204 при успехе.
+    """
+    svc = DocumentService(db)
+    doc = await svc.delete_document(doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Документ не найден.")
+
+    try:
+        await db.commit()
+    except Exception as exc:
+        await db.rollback()
+        logger.error(f"Ошибка при удалении документа {doc_id} из БД: {exc}")
+        raise HTTPException(status_code=500, detail="Ошибка удаления документа из базы данных.")
+
+    # Cascade delete from MinIO — non-fatal: DB record is already gone
+    minio = get_minio_service()
+    if doc.s3_path:
+        minio.delete_source_file(doc.s3_path)
+    if doc.result_path:
+        minio.delete_result_json(doc.result_path)
+
+    logger.info(f"Документ {doc_id} удалён (s3={doc.s3_path}, result={doc.result_path})")
 
 
 @router.post("/ask", response_model=AskResponse)

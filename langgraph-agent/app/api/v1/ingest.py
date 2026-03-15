@@ -43,16 +43,36 @@ async def upload_document(request: Request, file: UploadFile = File(...)) -> JSO
         raise HTTPException(status_code=400, detail="filename is required")
 
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    allowed = {"pdf", "png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp"}
-    if ext not in allowed:
+    _ALLOWED_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp"}
+    if ext not in _ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=415,
-            detail=f"Unsupported file type '.{ext}'. Allowed: {', '.join(sorted(allowed))}",
+            detail=f"Unsupported file type '.{ext}'. Allowed: {', '.join(sorted(_ALLOWED_EXTENSIONS))}",
+        )
+
+    # Validate that the declared content_type is consistent with the extension.
+    # Rejects mismatches like a .exe renamed to .pdf.
+    _MIME_BY_EXT: dict[str, set[str]] = {
+        "pdf":  {"application/pdf"},
+        "png":  {"image/png"},
+        "jpg":  {"image/jpeg"},
+        "jpeg": {"image/jpeg"},
+        "tiff": {"image/tiff"},
+        "tif":  {"image/tiff"},
+        "bmp":  {"image/bmp", "image/x-bmp"},
+        "webp": {"image/webp"},
+    }
+    declared_mime = (file.content_type or "").split(";")[0].strip().lower()
+    if declared_mime and declared_mime not in _MIME_BY_EXT.get(ext, set()):
+        raise HTTPException(
+            status_code=415,
+            detail=f"Content-Type '{declared_mime}' does not match file extension '.{ext}'",
         )
 
     content = await file.read()
-    if len(content) > 50 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
+    s = get_settings()
+    if len(content) > s.max_upload_size_mb * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File too large (max {s.max_upload_size_mb} MB)")
 
     url = f"{_ocr_url()}/api/v1/upload"
     try:

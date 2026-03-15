@@ -1,0 +1,59 @@
+name: Python CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install global tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Install ocr-service dependencies (API + chunker + dev)
+        working-directory: ocr-service
+        run: |
+          if [ -f requirements/api.txt ]; then pip install -r requirements/api.txt; fi
+          if [ -f requirements/chunker.txt ]; then pip install -r requirements/chunker.txt; fi
+          if [ -f requirements/dev.txt ]; then pip install -r requirements/dev.txt; fi
+
+      - name: Install langgraph-agent dependencies
+        working-directory: langgraph-agent
+        run: |
+          pip install ".[dev]"
+
+      - name: Lint ocr-service with ruff
+        run: |
+          ruff check ocr-service
+
+      - name: Lint langgraph-agent with ruff
+        run: |
+          ruff check langgraph-agent
+
+      - name: Run ocr-service tests
+        working-directory: ocr-service
+        run: |
+          pytest -q
+
+      - name: Run langgraph-agent tests
+        working-directory: langgraph-agent
+        run: |
+          pytest -q
+

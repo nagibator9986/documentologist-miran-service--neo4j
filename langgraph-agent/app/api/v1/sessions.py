@@ -4,9 +4,10 @@ from __future__ import annotations
 import logging
 
 import asyncpg
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from ...core.config import get_settings
+from ...core.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,8 @@ async def _connect() -> asyncpg.Connection:
 
 
 @router.get("/", summary="List recent sessions")
-async def list_sessions(limit: int = 20) -> dict:
+@limiter.limit("20/minute")
+async def list_sessions(request: Request, limit: int = 20) -> dict:
     """Return the most recently active sessions from PostgreSQL."""
     try:
         conn = await _connect()
@@ -59,7 +61,8 @@ async def list_sessions(limit: int = 20) -> dict:
 
 
 @router.get("/{session_id}/messages", summary="Load message history for a session")
-async def get_session_messages(session_id: str, limit: int = 100) -> dict:
+@limiter.limit("20/minute")
+async def get_session_messages(request: Request, session_id: str, limit: int = 100) -> dict:
     """Return all messages for a session from PostgreSQL."""
     if not session_id or len(session_id) > 128:
         raise HTTPException(status_code=400, detail="Invalid session_id")

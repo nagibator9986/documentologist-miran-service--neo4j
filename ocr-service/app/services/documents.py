@@ -22,14 +22,30 @@ def _encode_cursor(created_at: datetime, doc_id: uuid.UUID) -> str:
     return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
 
+class InvalidCursorError(ValueError):
+    """Raised when a pagination cursor cannot be decoded."""
+
+
 def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
-    """Decode cursor string back into (created_at, id) pair."""
-    payload = json.loads(base64.urlsafe_b64decode(cursor.encode()))
-    return datetime.fromisoformat(payload["ts"]), uuid.UUID(payload["id"])
+    """Decode cursor string back into (created_at, id) pair.
+
+    Raises:
+        InvalidCursorError: If the cursor is malformed, tampered, or expired.
+    """
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor.encode()))
+        return datetime.fromisoformat(payload["ts"]), uuid.UUID(payload["id"])
+    except Exception as exc:
+        raise InvalidCursorError(f"Неверный курсор пагинации: {exc}") from exc
 
 
 class DocumentService:
-    """CRUD + deduplication logic for documents."""
+    """CRUD + deduplication logic for documents.
+
+    All mutating methods flush to the session but do NOT commit — callers
+    are responsible for calling ``await session.commit()`` at the HTTP-request
+    boundary so that rollback remains possible on error.
+    """
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
@@ -37,7 +53,7 @@ class DocumentService:
     # ── queries ──────────────────────────────────────────────
 
     async def find_by_hash(self, file_hash: str) -> Document | None:
-        """Return document with the given hash, or None."""
+        """Return the most recent document with the given SHA-256 hash, or None."""
         stmt = (
             select(Document)
             .where(Document.file_hash == file_hash)
@@ -48,6 +64,7 @@ class DocumentService:
         return result.scalar_one_or_none()
 
     async def find_by_id(self, doc_id: uuid.UUID) -> Document | None:
+        """Return the document with the given UUID, or None if not found."""
         stmt = select(Document).where(Document.id == doc_id)
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
@@ -150,9 +167,27 @@ class DocumentService:
         return doc
 
     async def mark_duplicate(self, doc: Document) -> Document:
-        """Touch updated_at on a duplicate upload."""
+        """Touch updated_at on a duplicate-upload to surface it in audit queries."""
         doc.updated_at = datetime.now(timezone.utc)
         await self.session.flush()
+        logger.info(f"[AUDIT] Дублирующая загрузка документа {doc.id} (hash={doc.file_hash})")
+        return doc
+
+    async def delete_document(self, doc_id: uuid.UUID) -> "Document | None":
+        """Delete a document record and return it (or None if not found).
+
+        Caller is responsible for committing and cascading the MinIO deletion.
+        """
+        from sqlalchemy import delete as sa_delete
+
+        doc = await self.find_by_id(doc_id)
+        if doc is None:
+            return None
+        await self.session.execute(
+            sa_delete(Document).where(Document.id == doc_id)
+        )
+        await self.session.flush()
+        logger.info(f"[AUDIT] Документ {doc_id} удалён (hash={doc.file_hash})")
         return doc
 
     async def update_status(
@@ -163,6 +198,15 @@ class DocumentService:
         error_message: str | None = None,
         page_count: int | None = None,
     ) -> None:
+        """Update document processing status and optional metadata fields.
+
+        Args:
+            doc_id:        UUID of the document to update.
+            status:        New DocumentStatus value.
+            result_path:   Path to Surya OCR result in MinIO (set on completion).
+            error_message: Human-readable error description (set on failure).
+            page_count:    Number of pages detected in the source file.
+        """
         values: dict = {"status": status, "updated_at": datetime.now(timezone.utc)}
         if result_path is not None:
             values["result_path"] = result_path
@@ -175,4 +219,4 @@ class DocumentService:
             update(Document).where(Document.id == doc_id).values(**values)
         )
         await self.session.flush()
-        logger.info(f"Document {doc_id} → {status.value}")
+        logger.info(f"[AUDIT] Документ {doc_id} → статус={status.value}")

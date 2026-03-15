@@ -12,6 +12,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",  # .env may have vars for other services (docker-compose etc.)
     )
 
     # ── App ───────────────────────────────────────────────────────────
@@ -106,12 +107,101 @@ class Settings(BaseSettings):
     # Max characters of content shown in citation preview
     citation_preview_max_len: int = 200
 
+    # ── Reranker ──────────────────────────────────────────────────────
+    # Primary multilingual cross-encoder (mMARCO, 13 languages incl. Russian)
+    reranker_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    # Fallback cross-encoder if primary fails to load
+    reranker_fallback_model: str = "cross-encoder/ms-marco-MiniLM-L6-v2"
+    # Max characters of content fed to the cross-encoder per chunk
+    # 1024 chars ≈ 200-250 tokens; legal paragraphs often need full context
+    reranker_max_content: int = 1024
+
+    # ── Search pipeline tuning ────────────────────────────────────────
+    # Minimum sigmoid-normalised rerank score to consider context reliable.
+    # 0.25 (old default) allowed low-quality context and increased hallucination risk.
+    # 0.40 is a safer baseline: the cross-encoder must be reasonably confident
+    # before the LLM is given the context. Override in .env if recall matters more.
+    search_min_confidence: float = 0.40
+    # Seconds before parallel graph-enrichment step times out
+    graph_enrichment_timeout: float = 8.0
+    # num_predict for supervisor intent LLM call (only need 1-2 words out)
+    supervisor_num_predict: int = 32
+    # Char length above which the user query is treated as pasted document text
+    verify_pasted_doc_threshold: int = 300
+
+    # ── Qdrant vector schema ──────────────────────────────────────────
+    # Named vector used in dual-vector Qdrant collections (set by the indexer)
+    qdrant_named_vector: str = "q_vec"
+
+    # ── Neo4j index names ─────────────────────────────────────────────
+    # Fulltext index on Section.text_preview (created at startup)
+    neo4j_fulltext_index: str = "sectionText"
+
+    # ── PostgreSQL connection pool ────────────────────────────────────
+    pg_pool_min_size: int = 1
+    pg_pool_max_size: int = 5
+    # Thread pool workers for running async PG calls from sync context
+    pg_thread_workers: int = 2
+
     # ── Integration: OCR Service ──────────────────────────────────────
     # Base URL of the Surya OCR service (first step in the pipeline).
     # Example: http://ocr-api:8000
     ocr_service_url: str = "http://localhost:8000"
 
+    # ── File upload limits ────────────────────────────────────────────
+    # Maximum file size accepted by POST /api/v1/ingest (in megabytes)
+    max_upload_size_mb: int = 50
 
-@lru_cache
+    # ── Qdrant scan limits ────────────────────────────────────────────
+    # Maximum number of 200-record scroll batches for full-collection scan
+    # (used by qdrant_text_search fallback and list_documents endpoint)
+    qdrant_max_scan_batches: int = 50
+
+    # ── SSE streaming ─────────────────────────────────────────────────
+    # Number of words per SSE token event when streaming the final response
+    sse_word_chunk_size: int = 6
+
+    # ── Reranking ─────────────────────────────────────────────────────
+    # Multiplier applied to rerank_top_k to form the candidate pool size
+    # before cross-encoder scoring (higher = better recall, more CPU)
+    rerank_candidate_multiplier: int = 2
+
+    # ── Graph query thread pool ───────────────────────────────────────
+    # Worker threads for parallel Neo4j queries inside _retrieve_graph.
+    # Shared pool — created once, reused across all requests.
+    graph_pool_workers: int = 5
+
+    # ── MLflow Observability ──────────────────────────────────────────
+    # Set MLFLOW_ENABLED=true in .env to enable tracing.
+    # When false all tracing code is a no-op — zero overhead.
+    mlflow_enabled: bool = False
+    # MLflow tracking server URL (docker-compose: http://mlflow:5000)
+    mlflow_tracking_uri: str = "http://localhost:5000"
+    # Experiment groups all runs for this service together in the UI
+    mlflow_experiment_name: str = "miran-agent"
+
+
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Return the cached Settings singleton.
+
+    In production the .env file is loaded once at startup and never changes —
+    the cache is intentional and has no observable downside.
+
+    In tests, call `clear_settings_cache()` after patching env vars to force
+    a fresh Settings() load.
+    """
     return Settings()
+
+
+def clear_settings_cache() -> None:
+    """Invalidate the settings cache so the next call re-reads the environment.
+
+    Use in unit/integration tests that patch environment variables:
+
+        def test_something(monkeypatch):
+            monkeypatch.setenv("OLLAMA_MODEL", "mistral:latest")
+            clear_settings_cache()
+            assert get_settings().ollama_model == "mistral:latest"
+    """
+    get_settings.cache_clear()

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from langchain_core.tools import tool
@@ -42,21 +43,32 @@ def qdrant_search(
 
     vector = _embed_query(query)
 
+    named_vector = s.qdrant_named_vector
+    # Validate named_vector before use — prevents injection via misconfigured .env
+    if named_vector and not re.match(r"^[a-zA-Z0-9_]+$", named_vector):
+        logger.error(
+            "qdrant_named_vector %r contains unsafe characters — skipping named vector",
+            named_vector,
+        )
+        named_vector = ""
+
     # Try named vector first (dual-vector collections from bank_knowledge)
     try:
+        if not named_vector:
+            raise ValueError("named_vector not configured — using default")
         response = client.query_points(
             collection_name=col,
             query=vector,
-            using="q_vec",
+            using=named_vector,
             limit=limit,
             offset=offset,
             with_payload=True,
         )
         results = response.points
-        logger.debug("qdrant_search used named vector 'q_vec' for collection '%s'", col)
+        logger.debug("qdrant_search used named vector '%s' for collection '%s'", named_vector, col)
     except (UnexpectedResponse, Exception) as exc:
         # Named vector not available — fall back to default vector
-        logger.debug("qdrant_search 'q_vec' unavailable (%s), trying default vector", type(exc).__name__)
+        logger.debug("qdrant_search '%s' unavailable (%s), trying default vector", named_vector, type(exc).__name__)
         try:
             response = client.query_points(
                 collection_name=col,
@@ -87,6 +99,54 @@ def qdrant_search(
         })
     logger.debug("qdrant_search '%s' → %d hits (offset=%d)", query, len(hits), offset)
     return hits
+
+
+def qdrant_scroll_by_doc_ids(
+    doc_ids: list[str],
+    max_chunks_per_doc: int = 10,
+) -> list[str]:
+    """Fetch text chunks from Qdrant filtered by doc_id values in meta_json.
+
+    Keeps qdrant_client.models inside the tool layer so callers (agents)
+    don't need to import infrastructure types directly.
+
+    Args:
+        doc_ids: Document identifiers to filter on (up to 3 used).
+        max_chunks_per_doc: Max chunks fetched per doc_id.
+
+    Returns:
+        List of text strings (content snippets) for all matching chunks.
+    """
+    from qdrant_client import models as qmodels
+
+    s = get_settings()
+    client = get_qdrant_client()
+    chunks: list[str] = []
+
+    for doc_id in doc_ids[:3]:
+        try:
+            records, _ = client.scroll(
+                collection_name=s.qdrant_collection,
+                scroll_filter=qmodels.Filter(
+                    must=[qmodels.FieldCondition(
+                        key="meta_json",
+                        match=qmodels.MatchText(text=doc_id),
+                    )]
+                ),
+                limit=max_chunks_per_doc,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for r in records:
+                payload = r.payload or {}
+                text = payload.get("answer") or payload.get("text", "")
+                if text:
+                    chunks.append(text[:s.content_snippet_max_len])
+        except Exception as exc:
+            logger.warning("qdrant_scroll_by_doc_ids(%r) failed: %s", doc_id, exc)
+
+    logger.debug("qdrant_scroll_by_doc_ids(%s) → %d chunks", doc_ids, len(chunks))
+    return chunks
 
 
 @tool

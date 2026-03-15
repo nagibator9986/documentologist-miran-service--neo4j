@@ -22,6 +22,8 @@ engine = create_async_engine(
     echo=False,
     pool_size=10,
     max_overflow=20,
+    pool_pre_ping=True,    # validate connections on checkout (detects stale TCP)
+    pool_recycle=3600,     # recycle connections after 1 hour (avoids idle timeout drops)
 )
 
 async_session_factory = async_sessionmaker(

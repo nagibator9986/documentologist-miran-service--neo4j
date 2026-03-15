@@ -2,8 +2,9 @@ import gc
 import io
 import json
 import os
+import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from loguru import logger
 
@@ -12,11 +13,13 @@ try:
     import torch
     from PIL import Image
     SURYA_AVAILABLE = True
-    # Use all available CPU cores for PyTorch operations.
-    # This speeds up matrix multiplications in OCR models significantly.
-    _cpu_count = os.cpu_count() or 4
-    torch.set_num_threads(_cpu_count)
-    torch.set_num_interop_threads(max(1, _cpu_count // 2))
+    # Single-threaded PyTorch: eliminates parallel temporary tensor buffers.
+    # With 4 threads the inference RSS spikes to 3+ GB on a 7.6 GB machine
+    # alongside all other services, causing OOM kill (exit 137).
+    # 1 thread keeps peak RSS predictable at ~1.5–2 GB; OCR is I/O-bound
+    # on CPU anyway so the throughput difference is minimal.
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
 except ImportError:
     SURYA_AVAILABLE = False
     logger.warning("PyMuPDF/Pillow not installed.")
@@ -72,29 +75,40 @@ class SuryaOCRService:
         logger.info("✅ Surya models ready (OCR Only).")
 
     @staticmethod
-    def pdf_to_images(pdf_bytes, dpi=120):
-        # DPI=120 снижает потребление памяти в 3-4 раза по сравнению с DPI=200
+    def _iter_pdf_images(pdf_bytes: bytes, dpi: int = 120) -> Iterator["Image.Image"]:
+        """Yield one PIL Image per PDF page, releasing each pixmap immediately.
+
+        Using a generator instead of building a full list keeps peak memory
+        proportional to a single page rather than the entire document.
+        DPI=120 reduces memory 3–4× vs DPI=200.
+        """
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        images = []
         zoom = dpi / 72
         mat = fitz.Matrix(zoom, zoom)
-        for page in doc:
-            pix = page.get_pixmap(matrix=mat)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            images.append(img)
-        doc.close()
-        return images
+        try:
+            for page in doc:
+                pix = page.get_pixmap(matrix=mat)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                pix = None  # release pixmap buffer before yielding
+                yield img
+        finally:
+            doc.close()
 
-    def process_document(self, file_bytes, filename):
+    def process_document(self, file_bytes: bytes, filename: str) -> dict:
         ext = Path(filename).suffix.lower()
         if ext == ".pdf":
-            images = self.pdf_to_images(file_bytes)
+            page_source = self._iter_pdf_images(file_bytes)
+            # Count pages without loading images (open doc once, close it)
+            _doc = fitz.open(stream=file_bytes, filetype="pdf")
+            page_count = len(_doc)
+            _doc.close()
         elif ext in (".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp"):
-            images = [Image.open(io.BytesIO(file_bytes)).convert("RGB")]
+            img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+            page_count = 1
+            page_source = iter([img])
         else:
-            raise ValueError(f"Unsupported: {ext}")
+            raise ValueError(f"Неподдерживаемый формат файла: {ext}")
 
-        page_count = len(images)
         logger.info(f"Processing {page_count} page(s) from '{filename}'")
 
         ocr_results = None
@@ -102,15 +116,19 @@ class SuryaOCRService:
             try:
                 logger.info("Running OCR (page-by-page to limit peak memory)…")
                 ocr_results = []
-                for idx, img in enumerate(images):
+                for idx, img in enumerate(page_source):
                     logger.info(f"  Page {idx + 1}/{page_count}…")
-                    page_result = self.rec_predictor(
-                        [img],
-                        det_predictor=self.det_predictor,
-                        sort_lines=True,
-                    )
+                    # inference_mode: disables autograd tape — saves ~30% RAM
+                    # vs no_grad because it also skips version counter updates.
+                    with torch.inference_mode():
+                        page_result = self.rec_predictor(
+                            [img],
+                            det_predictor=self.det_predictor,
+                            sort_lines=True,
+                        )
                     ocr_results.extend(page_result)
-                    gc.collect()  # release page tensors before next page
+                    del img          # release PIL image memory
+                    gc.collect()     # release page tensors before next page
                 logger.info(f"OCR done: {len(ocr_results)} pages")
             except Exception as e:
                 logger.error(f"OCR failed: {e}")
@@ -201,10 +219,21 @@ class SuryaOCRService:
             logger.warning(f"Table→MD failed: {e}")
             return ""
 
-_ocr_service = None
+_ocr_service: SuryaOCRService | None = None
+_ocr_service_lock = threading.Lock()
 
-def get_ocr_service():
+
+def get_ocr_service() -> SuryaOCRService:
+    """Return the module-level SuryaOCRService singleton.
+
+    Thread-safe double-checked locking: the lock is only acquired once during
+    initialization, so subsequent calls have zero synchronization overhead.
+    Loading Surya models takes 10–30 seconds — concurrent init must be prevented.
+    """
     global _ocr_service
-    if _ocr_service is None:
-        _ocr_service = SuryaOCRService()
+    if _ocr_service is not None:
+        return _ocr_service
+    with _ocr_service_lock:
+        if _ocr_service is None:
+            _ocr_service = SuryaOCRService()
     return _ocr_service

@@ -1,6 +1,7 @@
 """Tool: BM25 full-text search over a list of documents."""
 from __future__ import annotations
 
+import heapq
 import logging
 import re
 from typing import Any
@@ -49,7 +50,7 @@ def bm25_search(query: str, documents: list[dict[str, Any]], top_k: int = 20) ->
 
     scores = bm25.get_scores(query_tokens)
 
-    indexed = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
+    indexed = heapq.nlargest(top_k, enumerate(scores), key=lambda x: x[1])
     results = []
     for idx, score in indexed:
         if score > 0:

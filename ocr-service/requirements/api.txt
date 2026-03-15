@@ -5,5 +5,14 @@ fastapi>=0.110,<1
 uvicorn[standard]>=0.27,<1
 python-multipart>=0.0.7,<1
 
+# ── HTTP client (async status enrichment) ─
+httpx>=0.27,<1
+
+# ── Rate limiting ─────────────────────────
+slowapi>=0.1.9,<1
+# Redis backend for rate limiting — required for multi-replica deployments.
+# slowapi uses the `limits` library; limits[redis] installs the redis driver.
+limits[redis]>=3.6,<4
+
 # ── Observability ─────────────────────────
 prometheus-client>=0.20,<1

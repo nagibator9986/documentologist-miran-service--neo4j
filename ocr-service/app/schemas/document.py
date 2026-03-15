@@ -41,6 +41,10 @@ class StatusResponse(BaseModel):
     filename: str
     result_path: str | None = None
     error_message: str | None = None
+    # Optional downstream indexing status from bank_knowledge indexer.
+    # Populated by the API layer when INDEXER_STATUS_URL is configured.
+    indexing_status: str | None = None
+    indexing_message: str | None = None
 
 
 class DocumentListResponse(BaseModel):

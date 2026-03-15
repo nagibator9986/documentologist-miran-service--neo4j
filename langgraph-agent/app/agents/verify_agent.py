@@ -1,11 +1,12 @@
-"""Verify Agent — compliance check, risk scoring, law reference matching.
+"""Verify Agent — compliance check and risk scoring.
 
-Improvements:
-- Fetches actual document content when document_ids are provided
-- Treats long user queries (>300 chars) as pasted document text
-- Uses s.history_turns from config
-- Uses invoke_with_retry for resilience
-- Multi-intent: prepends combined_responses from prior agents
+Pipeline:
+  1. _fetch_document_content — resolve what to verify (IDs / pasted text / search)
+  2. _fetch_legal_context    — gather applicable norms from Qdrant + Neo4j
+  3. _run_compliance_llm     — LLM JSON generation
+  4. _parse_verify_result    — validate and normalise the JSON payload
+  5. _format_summary         — produce human-readable summary string
+  6. verify_node             — orchestrator
 """
 from __future__ import annotations
 
@@ -16,118 +17,84 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ..core.config import get_settings
 from ..core.llm import get_json_llm, invoke_with_retry
-from ..core.utils import build_history_messages, safe_parse_json
+from ..core.utils import build_final_response, build_history_messages, safe_parse_json
 from ..graph.state import AgentState
+from ..prompts import VERIFY_COMPLIANCE
 from ..tools.neo4j_query import graph_obligation_search, graph_section_search
-from ..tools.qdrant_search import qdrant_search
+from ..tools.qdrant_search import qdrant_scroll_by_doc_ids, qdrant_search
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM = """Ты — юридический эксперт по банковскому праву Казахстана.
-Проанализируй документ / запрос на соответствие законодательству.
-ВАЖНО: Все строки в JSON должны быть на русском языке.
 
-Выдай JSON в точном формате:
-{
-  "compliant": true,
-  "risk_score": 5,
-  "issues": ["список нарушений или рисков"],
-  "law_refs": ["ссылки на статьи законов"],
-  "fix_hints": ["рекомендации по исправлению"]
-}"""
-
+# ── Stage 1: Document content resolution ─────────────────────────────────────
 
 def _fetch_document_content(state: AgentState, query: str) -> str:
-    """Extract the document content to verify.
+    """Resolve what text to verify, in priority order:
 
-    Priority:
-    1. document_ids provided -> fetch from Qdrant by scrolling for those IDs
-    2. Long query (>300 chars) -> treat the query itself as pasted document text
-    3. Otherwise -> search Qdrant for the most relevant document chunks
+    1. Explicit document_ids → fetch chunks from Qdrant by payload filter.
+    2. Long query (> verify_pasted_doc_threshold chars) → treat as pasted doc.
+    3. Fallback → search Qdrant for the most relevant chunks.
     """
     s = get_settings()
 
-    # 1. Explicit document IDs — filter Qdrant by payload meta_json field.
-    # NOTE: document_ids are OCR doc UUIDs (PostgreSQL), NOT Qdrant point UUIDs.
-    # client.retrieve() expects Qdrant point IDs — must use scroll with payload filter instead.
     doc_ids = state.get("document_ids") or []
     if doc_ids:
-        from ..core.utils import get_qdrant_client
-        from qdrant_client import models as qmodels
-        client = get_qdrant_client()
-        try:
-            chunks = []
-            for doc_id in doc_ids[:3]:  # limit to 3 docs to avoid context overflow
-                records, _ = client.scroll(
-                    collection_name=s.qdrant_collection,
-                    scroll_filter=qmodels.Filter(
-                        must=[qmodels.FieldCondition(
-                            key="meta_json",
-                            match=qmodels.MatchText(text=doc_id),
-                        )]
-                    ),
-                    limit=10,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-                for r in records:
-                    payload = r.payload or {}
-                    text = payload.get("answer") or payload.get("text", "")
-                    if text:
-                        chunks.append(text[:s.content_snippet_max_len])
-            if chunks:
-                logger.info("verify_node: fetched %d chunks for document_ids=%s", len(chunks), doc_ids)
-                return "\n\n".join(chunks)
-        except Exception as exc:
-            logger.warning("verify_node: failed to fetch document_ids from Qdrant: %s", exc)
+        chunks = qdrant_scroll_by_doc_ids(doc_ids)
+        if chunks:
+            logger.info("verify: fetched %d chunks for document_ids=%s", len(chunks), doc_ids)
+            return "\n\n".join(chunks)
 
-    # 2. User pasted full document text inline (long query)
-    if len(query) > 300:
-        logger.info("verify_node: using long query (%d chars) as document text", len(query))
+    if len(query) > s.verify_pasted_doc_threshold:
+        logger.info("verify: using long query (%d chars) as document text", len(query))
         return query
 
-    # 3. Search for the most relevant chunks to verify
     hits = qdrant_search.invoke({"query": query, "limit": 5})
     if hits:
-        return "\n\n".join(f"[{i+1}] {h.get('content', '')[:s.content_snippet_max_len]}"
-                           for i, h in enumerate(hits))
+        return "\n\n".join(
+            f"[{i + 1}] {h.get('content', '')[:s.content_snippet_max_len]}"
+            for i, h in enumerate(hits)
+        )
 
-    return query  # fallback: use the query text as-is
+    return query
 
 
-def verify_node(state: AgentState) -> AgentState:
-    """Check compliance and compute risk score."""
-    t_start = time.perf_counter()
-    s = get_settings()
-    query = state["user_query"]
+# ── Stage 2: Legal context aggregation ───────────────────────────────────────
 
-    # 1. Get the actual document content to verify
-    doc_content = _fetch_document_content(state, query)
+def _fetch_legal_context(query: str, state: AgentState | None = None) -> tuple[str, str, str]:
+    """Gather applicable norms from Qdrant and Neo4j.
 
-    # 2. Retrieve legal context from Qdrant
-    legal_hits = qdrant_search.invoke({"query": query, "limit": 5})
-    legal_context = "\n".join(f"- {h.get('content', '')[:400]}" for h in legal_hits)
+    Reuses state["reranked_docs"] from a prior search agent pass (multi-intent)
+    to avoid redundant Qdrant calls when search already ran in the same turn.
 
-    # 3. Neo4j: relevant legal sections and article references
-    graph_context_parts: list[str] = []
+    Returns:
+        (legal_context, graph_context, obl_context) — all formatted as strings.
+    """
+    prior_docs = (state or {}).get("reranked_docs") or []
+    if prior_docs:
+        legal_hits = prior_docs
+        logger.info("verify: reusing %d reranked_docs from search agent", len(legal_hits))
+    else:
+        legal_hits = qdrant_search.invoke({"query": query, "limit": 5})
+    legal_context = "\n".join(
+        f"- {h.get('content', '')[:400]}" for h in legal_hits
+    ) or "нет данных"
+
+    graph_parts: list[str] = []
     try:
         sections = graph_section_search.invoke({"keywords": query[:60], "limit": 3})
         for sec in sections:
             text = (sec.get("text") or "")[:500]
             articles = sec.get("articles") or []
-            article_refs = ", ".join(
+            refs = ", ".join(
                 f"Статья {a.get('number')}" + (f" «{a.get('title')}»" if a.get("title") else "")
                 for a in articles if a.get("number")
             )
-            entry = text
-            if article_refs:
-                entry += f"\n[{article_refs}]"
-            graph_context_parts.append(entry)
+            entry = text + (f"\n[{refs}]" if refs else "")
+            graph_parts.append(entry)
     except Exception as exc:
-        logger.warning("Graph section search failed in verify_node: %s", exc)
+        logger.warning("verify: graph section search failed: %s", exc)
 
-    # 4. Neo4j: obligation context
-    obl_context_parts: list[str] = []
+    obl_parts: list[str] = []
     try:
         obls = graph_obligation_search.invoke({"keywords": query[:60], "limit": 4})
         for obl in obls:
@@ -137,77 +104,109 @@ def verify_node(state: AgentState) -> AgentState:
             if obl.get("deadline"):
                 line += f" (срок: {obl['deadline']})"
             if line:
-                obl_context_parts.append(line)
+                obl_parts.append(line)
     except Exception as exc:
-        logger.warning("Obligation search failed in verify_node: %s", exc)
+        logger.warning("verify: obligation search failed: %s", exc)
 
-    graph_context = "\n\n".join(graph_context_parts) if graph_context_parts else "нет данных"
-    obl_context = "\n".join(f"- {o}" for o in obl_context_parts) or "нет данных"
+    graph_context = "\n\n".join(graph_parts) or "нет данных"
+    obl_context = "\n".join(f"- {o}" for o in obl_parts) or "нет данных"
+    return legal_context, graph_context, obl_context
 
-    # Distinguish between user-query-as-document vs fetched content
-    doc_label = "Содержимое документа" if len(doc_content) > 300 else "Запрос/фрагмент"
+
+# ── Stage 3: LLM compliance analysis ─────────────────────────────────────────
+
+def _run_compliance_llm(
+    doc_content: str,
+    legal_context: str,
+    graph_context: str,
+    obl_context: str,
+    state: AgentState,
+) -> str:
+    """Call LLM to produce compliance JSON."""
+    s = get_settings()
+    doc_label = (
+        "Содержимое документа" if len(doc_content) > s.verify_pasted_doc_threshold
+        else "Запрос/фрагмент"
+    )
     prompt = (
         f"{doc_label}:\n{doc_content}\n\n"
         f"Применимые нормы (векторный поиск):\n{legal_context}\n\n"
         f"Релевантные статьи из графа знаний:\n{graph_context}\n\n"
         f"Выявленные обязательства из графа:\n{obl_context}"
     )
-
     llm = get_json_llm(num_predict=1024)
     history = build_history_messages(state, max_turns=s.history_turns)
-    raw = invoke_with_retry(llm, [
-        SystemMessage(content=_SYSTEM),
+    return invoke_with_retry(llm, [
+        SystemMessage(content=VERIFY_COMPLIANCE),
         *history,
         HumanMessage(content=prompt),
     ])
 
-    _fallback: dict = {
+
+# ── Stage 4: Result normalisation ────────────────────────────────────────────
+
+def _parse_verify_result(raw: str) -> dict:
+    """Parse LLM JSON, clamp risk_score to [0,10], add trinary compliance label."""
+    fallback = {
         "compliant": None,
         "risk_score": -1,
         "issues": ["Не удалось разобрать ответ модели"],
         "law_refs": [],
         "fix_hints": [],
     }
-    verify_result = safe_parse_json(raw, _fallback)
+    result = safe_parse_json(raw, fallback)
 
-    # Trinary compliance label
-    compliant = verify_result.get("compliant")
+    compliant = result.get("compliant")
     if compliant is True:
-        compliant_label = "Да"
+        result["compliant_label"] = "Да"
     elif compliant is False:
-        compliant_label = "Нет"
+        result["compliant_label"] = "Нет"
     else:
-        compliant_label = "Не определено"
+        result["compliant_label"] = "Не определено"
 
-    # Clamp risk_score to [0, 10]
-    raw_score = verify_result.get("risk_score", -1)
+    raw_score = result.get("risk_score", -1)
     try:
-        risk_score = max(0, min(10, int(raw_score)))
-        if raw_score != risk_score:
-            logger.warning("verify_node: risk_score %r clamped to %d", raw_score, risk_score)
+        score = max(0, min(10, int(raw_score)))
+        if raw_score != score:
+            logger.warning("verify: risk_score %r clamped to %d", raw_score, score)
+        result["risk_score"] = score
     except (TypeError, ValueError):
-        logger.warning("verify_node: invalid risk_score %r — defaulting to 5", raw_score)
-        risk_score = 5
-    verify_result["risk_score"] = risk_score
+        logger.warning("verify: invalid risk_score %r — defaulting to 5", raw_score)
+        result["risk_score"] = 5
 
-    summary = (
-        f"Соответствие: {compliant_label}\n"
-        f"Риск-оценка: {risk_score}/10\n"
-        f"Проблемы: {'; '.join(verify_result.get('issues', []))}\n"
-        f"Рекомендации: {'; '.join(verify_result.get('fix_hints', []))}"
+    return result
+
+
+# ── Stage 5: Human-readable summary ──────────────────────────────────────────
+
+def _format_summary(result: dict) -> str:
+    # Use `or []` instead of default= to guard against LLM returning null for list fields
+    return (
+        f"Соответствие: {result['compliant_label']}\n"
+        f"Риск-оценка: {result['risk_score']}/10\n"
+        f"Проблемы: {'; '.join(result.get('issues') or [])}\n"
+        f"Рекомендации: {'; '.join(result.get('fix_hints') or [])}"
     )
 
-    # Multi-intent: prepend previous agents' responses
-    combined_prev = state.get("combined_responses") or []
-    if combined_prev:
-        final_response = "\n\n---\n\n".join(combined_prev) + "\n\n---\n\n" + summary
-    else:
-        final_response = summary
+
+# ── Graph entry point ─────────────────────────────────────────────────────────
+
+def verify_node(state: AgentState) -> AgentState:
+    """Compliance check node: fetch doc → gather norms → LLM → risk score."""
+    t_start = time.perf_counter()
+    query = state["user_query"]
+
+    doc_content = _fetch_document_content(state, query)
+    legal_context, graph_context, obl_context = _fetch_legal_context(query, state)
+    raw = _run_compliance_llm(doc_content, legal_context, graph_context, obl_context, state)
+    verify_result = _parse_verify_result(raw)
+    summary = _format_summary(verify_result)
+    final_response = build_final_response(summary, state.get("combined_responses") or [])
 
     elapsed = time.perf_counter() - t_start
     logger.info(
         "verify_node: compliant=%s risk=%d elapsed=%.2fs",
-        compliant_label, risk_score, elapsed,
+        verify_result["compliant_label"], verify_result["risk_score"], elapsed,
     )
 
     return {
@@ -217,8 +216,7 @@ def verify_node(state: AgentState) -> AgentState:
         "retrieval_metrics": {
             "node": "verify",
             "doc_content_len": len(doc_content),
-            "legal_hits": len(legal_hits),
-            "risk_score": risk_score,
+            "risk_score": verify_result["risk_score"],
             "elapsed_s": round(elapsed, 2),
         },
         "messages": state["messages"] + [AIMessage(content=final_response)],

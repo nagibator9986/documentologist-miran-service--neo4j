@@ -15,12 +15,13 @@ import re
 import uuid
 from typing import AsyncGenerator
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field, field_validator
 
 from ...core.config import get_settings
+from ...core.rate_limit import limiter
 from ...graph.workflow import graph
 
 logger = logging.getLogger(__name__)
@@ -198,7 +199,7 @@ async def _sse_stream(initial_state: dict) -> AsyncGenerator[str, None]:
         chunk_words: list[str] = []
         for word in words:
             chunk_words.append(word)
-            if len(chunk_words) >= 6:
+            if len(chunk_words) >= s.sse_word_chunk_size:
                 yield _sse_event("token", {"text": " ".join(chunk_words) + " "})
                 chunk_words = []
                 await asyncio.sleep(0)
@@ -207,12 +208,14 @@ async def _sse_stream(initial_state: dict) -> AsyncGenerator[str, None]:
 
     intent = final_state.get("intent", initial_state.get("intent", "search"))
     yield _sse_event("done", {
-        "session_id": initial_state["session_id"],
-        "intent": intent,
-        "intents": final_state.get("intents", [intent]),
-        "citations": final_state.get("citations", []),
-        "export_path": final_state.get("export_path"),
-        "verify_result": final_state.get("verify_result") or None,
+        "session_id":       initial_state["session_id"],
+        "intent":           intent,
+        "intents":          final_state.get("intents", [intent]),
+        "citations":        final_state.get("citations", []),
+        "export_path":      final_state.get("export_path"),
+        "verify_result":    final_state.get("verify_result") or None,
+        "generate_result":  final_state.get("generate_result") or None,
+        "analyze_result":   final_state.get("analyze_result") or None,
         "retrieval_metrics": final_state.get("retrieval_metrics") or None,
     })
 
@@ -222,7 +225,8 @@ async def _sse_stream(initial_state: dict) -> AsyncGenerator[str, None]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 @router.post("/", response_model=ChatResponse, summary="Single-turn chat (REST)")
-async def chat(req: ChatRequest) -> ChatResponse:
+@limiter.limit("30/minute")
+async def chat(request: Request, req: ChatRequest) -> ChatResponse:
     """Send a message and receive a complete response."""
     if req.stream:
         raise HTTPException(
@@ -261,7 +265,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
 
 @router.post("/stream", summary="Streaming chat via SSE")
-async def chat_stream(req: ChatRequest) -> StreamingResponse:
+@limiter.limit("30/minute")
+async def chat_stream(request: Request, req: ChatRequest) -> StreamingResponse:
     """Send a message and receive a streamed SSE response with node-level progress."""
     initial_state = _build_initial_state(req)
     return StreamingResponse(

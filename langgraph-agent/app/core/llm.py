@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from functools import lru_cache
 
 from langchain_ollama import ChatOllama, OllamaEmbeddings
@@ -16,6 +18,72 @@ from tenacity import (
 from .config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Circuit breaker — prevents request pile-up when Ollama is down
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _CircuitBreaker:
+    """Thread-safe circuit breaker for Ollama calls.
+
+    States:
+        CLOSED    — normal operation; all calls pass through.
+        OPEN      — Ollama unreachable; calls fail fast until recovery_timeout.
+        HALF_OPEN — one trial call allowed to probe Ollama health.
+
+    Transitions:
+        CLOSED → OPEN      : failure_threshold consecutive failures.
+        OPEN   → HALF_OPEN : recovery_timeout seconds elapsed since opening.
+        HALF_OPEN → CLOSED : trial call succeeds.
+        HALF_OPEN → OPEN   : trial call fails (resets the timeout).
+    """
+
+    _CLOSED = "closed"
+    _OPEN = "open"
+    _HALF_OPEN = "half_open"
+
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0) -> None:
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._failures = 0
+        self._state = self._CLOSED
+        self._opened_at: float = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def is_open(self) -> bool:
+        """Return True if calls should be short-circuited (no Ollama call)."""
+        with self._lock:
+            if self._state == self._OPEN:
+                if time.monotonic() - self._opened_at >= self._recovery_timeout:
+                    self._state = self._HALF_OPEN
+                    logger.info("CircuitBreaker → HALF_OPEN: allowing trial call to Ollama")
+                    return False  # allow the trial
+                return True
+            return False
+
+    def record_success(self) -> None:
+        with self._lock:
+            if self._state != self._CLOSED:
+                logger.info("CircuitBreaker → CLOSED: Ollama is healthy again")
+            self._failures = 0
+            self._state = self._CLOSED
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            if self._state == self._HALF_OPEN or self._failures >= self._failure_threshold:
+                self._opened_at = time.monotonic()
+                self._state = self._OPEN
+                logger.error(
+                    "CircuitBreaker → OPEN after %d failures — "
+                    "fast-failing requests for %.0fs",
+                    self._failures, self._recovery_timeout,
+                )
+
+
+_circuit_breaker = _CircuitBreaker()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -94,10 +162,16 @@ def get_embeddings() -> OllamaEmbeddings:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def invoke_with_retry(llm: ChatOllama, messages: list, *, max_retries: int | None = None) -> str:
-    """Call llm.invoke(messages) with exponential-backoff retry.
+    """Call llm.invoke(messages) with circuit breaker + exponential-backoff retry.
 
-    Returns the content string. Falls back to empty string on repeated failure.
+    Short-circuits immediately when the circuit is OPEN (Ollama is down).
+    Records success/failure to drive circuit breaker state transitions.
+    Returns the content string, or empty string on repeated failure.
     """
+    if _circuit_breaker.is_open:
+        logger.warning("invoke_with_retry: circuit OPEN — skipping Ollama call")
+        return ""
+
     s = get_settings()
     attempts = max_retries if max_retries is not None else s.ollama_max_retries
 
@@ -114,10 +188,14 @@ def invoke_with_retry(llm: ChatOllama, messages: list, *, max_retries: int | Non
         return llm.invoke(messages).content
 
     try:
-        return _call() or ""
+        result = _call() or ""
+        _circuit_breaker.record_success()
+        return result
     except RetryError as exc:
         logger.error("LLM invoke exhausted %d retries: %s", attempts, exc)
+        _circuit_breaker.record_failure()
         return ""
     except Exception as exc:
         logger.error("LLM invoke failed (non-retryable): %s", exc)
+        _circuit_breaker.record_failure()
         return ""
