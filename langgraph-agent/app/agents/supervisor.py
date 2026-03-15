@@ -23,15 +23,16 @@ Intent = Literal["ingest", "search", "verify", "generate", "analyze"]
 _VALID_INTENTS = {"ingest", "search", "verify", "generate", "analyze"}
 
 # Compound patterns (checked BEFORE single-intent classification).
-# Format: (regex, primary_intent, secondary_intent)
-_COMPOUND_PATTERNS: list[tuple[str, str, str]] = [
-    (r"найд\w{0,4}.{0,50}(проверь|провери|провер\w+)", "search", "verify"),
-    (r"поищ\w{0,4}.{0,50}(проверь|провери|провер\w+)", "search", "verify"),
-    (r"(проверь|провери).{0,50}(составь|создай|сгенер\w+)", "verify", "generate"),
-    (r"(найди|поищи).{0,50}(составь|создай|сгенер\w+)", "search", "generate"),
-    (r"(сравни|проанализ\w+).{0,50}(составь|создай|сгенер\w+)", "analyze", "generate"),
-    (r"(составь|создай).{0,50}(проверь|провери)", "generate", "verify"),
-    (r"найди.{0,5}и.{0,5}провер", "search", "verify"),
+# Pre-compiled for performance; non-greedy quantifiers prevent ReDoS.
+# Format: (compiled_pattern, primary_intent, secondary_intent)
+_COMPOUND_PATTERNS: list[tuple[re.Pattern, str, str]] = [
+    (re.compile(r"найд\w{0,4}.{0,50}?(проверь|провери|провер\w+)", re.I | re.U), "search", "verify"),
+    (re.compile(r"поищ\w{0,4}.{0,50}?(проверь|провери|провер\w+)", re.I | re.U), "search", "verify"),
+    (re.compile(r"(проверь|провери).{0,50}?(составь|создай|сгенер\w+)", re.I | re.U), "verify", "generate"),
+    (re.compile(r"(найди|поищи).{0,50}?(составь|создай|сгенер\w+)", re.I | re.U), "search", "generate"),
+    (re.compile(r"(сравни|проанализ\w+).{0,50}?(составь|создай|сгенер\w+)", re.I | re.U), "analyze", "generate"),
+    (re.compile(r"(составь|создай).{0,50}?(проверь|провери)", re.I | re.U), "generate", "verify"),
+    (re.compile(r"найди.{0,5}?и.{0,5}?провер", re.I | re.U), "search", "verify"),
 ]
 
 # High-confidence keyword routing (avoids LLM call for unambiguous queries).
@@ -107,7 +108,7 @@ def classify_intent(state: AgentState) -> AgentState:
 
     # 1. Check compound patterns first — preserves multi-intent before any single-intent check
     for pattern, primary, secondary in _COMPOUND_PATTERNS:
-        if re.search(pattern, q_lower):
+        if pattern.search(q_lower):
             logger.info(
                 "Supervisor: compound intent [%s, %s] query=%r",
                 primary, secondary, query[:80],

@@ -69,6 +69,16 @@ def _get_graph_pool() -> ThreadPoolExecutor:
     return _graph_pool
 
 
+def shutdown_graph_pool() -> None:
+    """Gracefully shut down the graph query thread pool. Call on app shutdown."""
+    global _graph_pool
+    with _graph_pool_lock:
+        if _graph_pool is not None:
+            _graph_pool.shutdown(wait=True, cancel_futures=False)
+            _graph_pool = None
+            logger.info("Graph query thread pool shut down.")
+
+
 # ── Domain-specific regex patterns ───────────────────────────────────────────
 
 _ARTICLE_NUM_RE = re.compile(r"[Сс]тать[яей]\s+(\d+)", re.UNICODE)

@@ -133,22 +133,23 @@ def session_clear(session_id: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _pg_pool: Any = None  # asyncpg.Pool instance, created lazily
-# Lock created lazily inside the running event loop (not at import time).
-_pg_pool_lock: asyncio.Lock | None = None
 
-
-def _get_pg_lock() -> asyncio.Lock:
-    """Return the module-level asyncpg lock, creating it on first call inside the event loop."""
-    global _pg_pool_lock
-    if _pg_pool_lock is None:
-        _pg_pool_lock = asyncio.Lock()
-    return _pg_pool_lock
+# threading.Lock guards the creation-decision only (avoids blocking the event
+# loop for subsequent calls — actual pool creation is awaited outside the lock).
+# Using threading.Lock (not asyncio.Lock) ensures correctness across multiple
+# event loops: _run_coro_sync spawns separate event loops via asyncio.run(), and
+# asyncio.Lock is bound to the loop it was created in, causing RuntimeError when
+# reused in a different loop.
+_pg_pool_creation_lock = threading.Lock()
 
 
 async def _get_pg_pool() -> Any:
     """Return (or create) the module-level asyncpg connection pool.
 
-    Uses a double-checked lock to prevent duplicate pool creation under concurrency.
+    Thread-safe double-checked locking pattern:
+      - threading.Lock guards the creation decision (runs briefly, no I/O).
+      - asyncpg pool creation is done outside the lock to avoid blocking.
+      - A second check inside the lock handles the rare concurrent-creation race.
     """
     import asyncpg
 
@@ -156,20 +157,33 @@ async def _get_pg_pool() -> Any:
     if _pg_pool is not None:
         return _pg_pool
 
-    async with _get_pg_lock():
-        if _pg_pool is not None:  # re-check after acquiring lock
-            return _pg_pool
-        s = get_settings()
-        _pg_pool = await asyncpg.create_pool(
-            dsn=s.postgres_dsn,
-            min_size=s.pg_pool_min_size,
-            max_size=s.pg_pool_max_size,
-            command_timeout=s.postgres_timeout,
-        )
-        logger.info(
-            "asyncpg pool created (min=%d, max=%d)",
-            s.pg_pool_min_size, s.pg_pool_max_size,
-        )
+    should_create = False
+    with _pg_pool_creation_lock:
+        if _pg_pool is None:
+            should_create = True
+
+    if not should_create:
+        return _pg_pool
+
+    s = get_settings()
+    candidate = await asyncpg.create_pool(
+        dsn=s.postgres_dsn,
+        min_size=s.pg_pool_min_size,
+        max_size=s.pg_pool_max_size,
+        command_timeout=s.postgres_timeout,
+    )
+
+    with _pg_pool_creation_lock:
+        if _pg_pool is None:
+            _pg_pool = candidate
+            logger.info(
+                "asyncpg pool created (min=%d, max=%d)",
+                s.pg_pool_min_size, s.pg_pool_max_size,
+            )
+        else:
+            # Another coroutine created the pool while we were awaiting — discard ours
+            await candidate.close()
+
     return _pg_pool
 
 
@@ -198,15 +212,21 @@ async def pg_save_message(session_id: str, user_id: str, role: str, content: str
         )
 
 
-def pg_save_message_sync(session_id: str, user_id: str, role: str, content: str) -> None:
-    """Synchronous wrapper around pg_save_message. Non-fatal on error."""
+def pg_save_message_sync(session_id: str, user_id: str, role: str, content: str) -> bool:
+    """Synchronous wrapper around pg_save_message.
+
+    Returns True on success, False on failure (non-fatal).
+    Callers can use the return value to decide whether to escalate logging.
+    """
     try:
         _run_coro_sync(
             pg_save_message(session_id, user_id, role, content),
             timeout=5,
         )
+        return True
     except Exception as exc:
         logger.warning("pg_save_message_sync failed (non-critical): %s", exc)
+        return False
 
 
 async def pg_ensure_schema() -> None:

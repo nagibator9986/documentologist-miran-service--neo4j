@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from langchain_core.tools import tool
@@ -43,8 +44,18 @@ def qdrant_search(
     vector = _embed_query(query)
 
     named_vector = s.qdrant_named_vector
+    # Validate named_vector before use — prevents injection via misconfigured .env
+    if named_vector and not re.match(r"^[a-zA-Z0-9_]+$", named_vector):
+        logger.error(
+            "qdrant_named_vector %r contains unsafe characters — skipping named vector",
+            named_vector,
+        )
+        named_vector = ""
+
     # Try named vector first (dual-vector collections from bank_knowledge)
     try:
+        if not named_vector:
+            raise ValueError("named_vector not configured — using default")
         response = client.query_points(
             collection_name=col,
             query=vector,

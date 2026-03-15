@@ -10,6 +10,7 @@ from typing import BinaryIO
 from loguru import logger
 from minio import Minio
 from minio.error import S3Error
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.core.config import get_settings
 
@@ -59,10 +60,19 @@ class MinIOService:
         safe_name = MinIOService.sanitize_filename(filename)
         return f"{file_hash}/{safe_name}"
 
+    @retry(
+        retry=retry_if_exception_type(S3Error),
+        wait=wait_exponential(multiplier=1, min=1, max=16),
+        stop=stop_after_attempt(4),
+        reraise=True,
+    )
     def upload_source_file(
         self, file_hash: str, filename: str, data: BinaryIO, size: int
     ) -> str:
-        """Upload original file. Returns the S3 path."""
+        """Upload original file. Returns the S3 path.
+
+        Retries up to 3 times with exponential backoff (1s, 2s, 4s) on S3Error.
+        """
         self._ensure_bucket(self.bucket_source)
         object_name = self.build_source_path(file_hash=file_hash, filename=filename)
         self.client.put_object(
@@ -74,8 +84,17 @@ class MinIOService:
         logger.info(f"Uploaded source file: {self.bucket_source}/{object_name}")
         return object_name
 
+    @retry(
+        retry=retry_if_exception_type(S3Error),
+        wait=wait_exponential(multiplier=1, min=1, max=16),
+        stop=stop_after_attempt(4),
+        reraise=True,
+    )
     def upload_result_json(self, file_hash: str, json_bytes: bytes) -> str:
-        """Upload Surya analysis JSON. Returns the S3 path."""
+        """Upload Surya analysis JSON. Returns the S3 path.
+
+        Retries up to 3 times with exponential backoff (1s, 2s, 4s) on S3Error.
+        """
         self._ensure_bucket(self.bucket_results)
         object_name = f"{file_hash}/surya_output.json"
         self.client.put_object(
@@ -111,6 +130,14 @@ class MinIOService:
             logger.info(f"Deleted source file: {self.bucket_source}/{s3_path}")
         except S3Error as e:
             logger.warning(f"Failed to delete source file {s3_path}: {e}")
+
+    def delete_result_json(self, result_path: str) -> None:
+        """Delete Surya result JSON from MinIO if present."""
+        try:
+            self.client.remove_object(self.bucket_results, result_path)
+            logger.info(f"Deleted result JSON: {self.bucket_results}/{result_path}")
+        except S3Error as e:
+            logger.warning(f"Failed to delete result JSON {result_path}: {e}")
 
     def health_check(self) -> bool:
         """Return True if MinIO is reachable."""

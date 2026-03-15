@@ -17,3 +17,4 @@ prefect>=3.0,<4
 # ── Utilities ────────────────────────────
 python-dotenv>=1.0,<2
 loguru>=0.7,<1
+tenacity>=8.2,<10

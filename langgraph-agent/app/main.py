@@ -15,13 +15,17 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from .api.v1.chat import router as chat_router
+from .api.v1.completions import router as completions_router
 from .api.v1.documents import router as documents_router
 from .api.v1.ingest import router as ingest_router
 from .api.v1.sessions import router as sessions_router
 from .core.config import get_settings
 from .core.rate_limit import limiter
 from .core.tracing import register_all_prompts, setup_mlflow
+from .agents.analyze_agent import shutdown_analyze_pool
+from .agents.search_agent import shutdown_graph_pool
 from .core.utils import close_all_clients, ensure_neo4j_fulltext_index
+from .tools.reranker import prewarm_cross_encoder
 from .tools.session_memory import pg_ensure_schema_sync, pg_shutdown
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -59,10 +63,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     setup_mlflow(s)
     register_all_prompts(s)
 
+    # Pre-warm cross-encoder so the first search request isn't slow.
+    prewarm_cross_encoder()
+
     yield
 
     # ── Shutdown ──────────────────────────────────────────────────────
     logger.info("LangGraph Agent shutting down — closing DB connections…")
+    shutdown_graph_pool()
+    shutdown_analyze_pool()
     close_all_clients()
     await pg_shutdown()
     logger.info("Shutdown complete.")
@@ -101,6 +110,7 @@ def create_app() -> FastAPI:
 
     # ── Routers ──────────────────────────────────────────────────────
     app.include_router(chat_router, prefix="/api/v1")
+    app.include_router(completions_router, prefix="/v1")   # OpenAI-compat
     app.include_router(documents_router, prefix="/api/v1")
     app.include_router(ingest_router, prefix="/api/v1")
     app.include_router(sessions_router, prefix="/api/v1")

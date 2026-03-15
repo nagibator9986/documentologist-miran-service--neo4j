@@ -1,9 +1,14 @@
-version: "3.9"
+x-langgraph-build: &langgraph-build
+  context: .
+  dockerfile: Dockerfile
+
+x-langgraph-image: &langgraph-image miran-service-langgraph-agent:latest
 
 services:
   # ── LangGraph Agent Service ────────────────────────────────────────────────
   langgraph-agent:
-    build: .
+    image: *langgraph-image
+    build: *langgraph-build
     container_name: langgraph-agent
     restart: unless-stopped
     ports:
@@ -73,6 +78,36 @@ services:
         condition: service_healthy
     volumes:
       - agent_exports:/exports
+
+  # ── Chainlit UI ────────────────────────────────────────────────────────────
+  chainlit-ui:
+    image: *langgraph-image
+    build: *langgraph-build
+    container_name: chainlit-ui
+    restart: unless-stopped
+    command:
+      - chainlit
+      - run
+      - chainlit_app.py
+      - --headless
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8501"
+    ports:
+      - "${CHAINLIT_PORT:-8501}:8501"
+    environment:
+      AGENT_URL: http://langgraph-agent:8001
+      DEBUG: "false"
+    depends_on:
+      langgraph-agent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8501 >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   # ── Qdrant ─────────────────────────────────────────────────────────────────
   qdrant:

@@ -281,7 +281,9 @@ def ensure_neo4j_fulltext_index() -> None:
     CONTAINS fallback is used for fulltext, B-tree lookups degrade to full scans.
     """
     from .config import get_settings
-    fulltext_index = get_settings().neo4j_fulltext_index
+    from ..tools.neo4j_query import _validate_identifier
+    raw_index = get_settings().neo4j_fulltext_index
+    fulltext_index = _validate_identifier(raw_index, "neo4j_fulltext_index")
 
     _BTREE_INDEXES = [
         ("doc_doc_id",        "FOR (d:Document)   ON (d.doc_id)"),
@@ -303,6 +305,7 @@ def ensure_neo4j_fulltext_index() -> None:
             if result.single():
                 logger.debug("Neo4j fulltext index '%s' already exists.", fulltext_index)
             else:
+                # fulltext_index already validated above — safe to interpolate
                 session.run(
                     f"CREATE FULLTEXT INDEX {fulltext_index} IF NOT EXISTS "
                     f"FOR (s:Section) ON EACH [s.text_preview]"

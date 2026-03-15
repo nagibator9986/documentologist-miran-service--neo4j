@@ -22,6 +22,27 @@ _ALLOWED_REL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ_")
 # Lucene special characters that break fulltext queries when unescaped
 _LUCENE_SPECIAL_RE = re.compile(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)')
 
+# Safe Cypher identifier: must start with a letter, contain only [a-zA-Z0-9_]
+_SAFE_IDENTIFIER_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
+
+
+def _validate_identifier(name: str, label: str = "identifier") -> str:
+    """Validate that *name* is a safe Cypher identifier before injecting into queries.
+
+    Neo4j index/procedure names are placed directly in Cypher strings (they cannot
+    be parameterised).  Restricting them to ``[a-zA-Z][a-zA-Z0-9_]*`` eliminates
+    injection risk while covering every valid Neo4j identifier.
+
+    Raises:
+        ValueError: if *name* is empty or contains unsafe characters.
+    """
+    if not name or not _SAFE_IDENTIFIER_RE.match(name):
+        raise ValueError(
+            f"Unsafe {label} {name!r} — must start with a letter and contain only "
+            "[a-zA-Z0-9_].  Check neo4j_fulltext_index in config/.env."
+        )
+    return name
+
 
 def _escape_lucene(text: str) -> str:
     """Escape Lucene special characters in fulltext search keywords.
@@ -102,7 +123,10 @@ def graph_section_search(keywords: str, limit: int = 5) -> list[dict[str, Any]]:
         try:
             # Escape Lucene special chars to prevent query parse errors
             safe_kw = _escape_lucene(keywords)
-            fulltext_index = get_settings().neo4j_fulltext_index
+            # _validate_identifier raises ValueError on unsafe names, preventing injection
+            fulltext_index = _validate_identifier(
+                get_settings().neo4j_fulltext_index, "neo4j_fulltext_index"
+            )
             cypher = f"""
                 CALL db.index.fulltext.queryNodes('{fulltext_index}', $kw)
                 YIELD node AS s, score

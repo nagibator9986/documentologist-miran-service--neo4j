@@ -50,7 +50,12 @@ class Document(Base):
         comment="Path to Surya JSON result in MinIO (analysis-results bucket)",
     )
     status: Mapped[DocumentStatus] = mapped_column(
-        Enum(DocumentStatus, name="document_status", create_type=True),
+        Enum(
+            DocumentStatus,
+            name="document_status",
+            create_type=True,
+            values_callable=lambda enum_cls: [item.value for item in enum_cls],
+        ),
         default=DocumentStatus.PENDING,
         nullable=False,
     )

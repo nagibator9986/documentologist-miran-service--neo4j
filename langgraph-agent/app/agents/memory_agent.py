@@ -20,9 +20,10 @@ logger = logging.getLogger(__name__)
 def memory_save_node(state: AgentState) -> AgentState:
     """Persist the latest turn to session memory. Non-fatal if Redis/PG unavailable.
 
-    Also finalises the multi-intent combined_responses: if prior agent responses
-    were accumulated in combined_responses, they are merged into final_response
-    so the REST endpoint always returns a single unified answer.
+    Tracks Redis and PG success independently. Logs ERROR when a backend
+    fails so operators can distinguish ephemeral blips from outages:
+      - WARNING: individual operation failed, retry may succeed.
+      - ERROR: both user + assistant messages failed for this turn.
     """
     session_id = state.get("session_id", "default")
     user_id = state.get("user_id", "anonymous")
@@ -32,29 +33,61 @@ def memory_save_node(state: AgentState) -> AgentState:
     # The final_response from the last agent is the complete merged response.
     response = state.get("final_response", "")
 
-    # Save user message to Redis
-    try:
-        session_save.invoke({"session_id": session_id, "role": "user", "content": query})
-    except Exception as exc:
-        logger.warning("Redis save (user) failed (non-critical): %s", exc)
+    # ── Redis (short-term) ─────────────────────────────────────────────────────
+    redis_failures = 0
+    for role, content in (("user", query), ("assistant", response)):
+        try:
+            session_save.invoke({"session_id": session_id, "role": role, "content": content})
+        except Exception as exc:
+            redis_failures += 1
+            logger.warning("Redis save (%s) failed for session=%s: %s", role, session_id, exc)
 
-    # Save assistant response to Redis
-    try:
-        session_save.invoke({"session_id": session_id, "role": "assistant", "content": response})
-        logger.info("Memory saved for session=%s", session_id)
-    except Exception as exc:
-        logger.warning("Redis save (assistant) failed (non-critical): %s", exc)
+    if redis_failures == 0:
+        logger.info("Memory saved to Redis for session=%s", session_id)
+    elif redis_failures == 2:
+        logger.error(
+            "Redis unavailable — both messages lost for session=%s. "
+            "Conversation history will not persist across restarts.",
+            session_id,
+        )
 
-    # Persist to PostgreSQL using sync wrapper
-    pg_save_message_sync(session_id, user_id, "user", query)
-    pg_save_message_sync(session_id, user_id, "assistant", response)
+    # ── PostgreSQL (long-term) ─────────────────────────────────────────────────
+    pg_user_ok = pg_save_message_sync(session_id, user_id, "user", query)
+    pg_asst_ok = pg_save_message_sync(session_id, user_id, "assistant", response)
+
+    if not pg_user_ok or not pg_asst_ok:
+        logger.error(
+            "PostgreSQL save incomplete for session=%s user=%s "
+            "(user_ok=%s, assistant_ok=%s) — long-term history may be incomplete.",
+            session_id, user_id, pg_user_ok, pg_asst_ok,
+        )
 
     return state
 
 
 def memory_load_node(state: AgentState) -> AgentState:
-    """Load conversation history. Non-fatal if Redis unavailable."""
+    """Load conversation history and reset per-turn transient fields.
+
+    Clears retrieval fields (vector_hits, bm25_hits, etc.) so that if
+    LangGraph checkpointing is ever enabled, stale retrieval data from a
+    prior turn will not bleed into the current one.
+
+    Non-fatal if Redis unavailable.
+    """
     session_id = state.get("session_id", "default")
+
+    # Reset per-turn retrieval fields — ensures clean state on every invocation
+    state = {
+        **state,
+        "vector_hits": [],
+        "bm25_hits": [],
+        "graph_hits": [],
+        "reranked_docs": [],
+        "combined_responses": [],
+        "citations": [],
+        "final_response": "",
+        "query_expanded": "",
+    }
 
     try:
         raw = session_load.invoke({"session_id": session_id})

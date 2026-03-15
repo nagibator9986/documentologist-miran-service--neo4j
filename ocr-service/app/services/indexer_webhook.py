@@ -11,6 +11,9 @@ but never re-raise so the OCR pipeline is never blocked.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import logging
 from typing import Any
 
@@ -19,6 +22,11 @@ import httpx
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _sign_payload(body: bytes, secret: str) -> str:
+    """Return HMAC-SHA256 hex digest of body signed with secret."""
+    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
 def notify_indexer(
@@ -60,10 +68,20 @@ def notify_indexer(
         "bucket_results": s.bucket_results,
     }
 
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if s.webhook_secret:
+        headers["X-Webhook-Signature"] = _sign_payload(body, s.webhook_secret)
+    else:
+        logger.warning(
+            "notify_indexer: WEBHOOK_SECRET not set — sending unsigned request to %s", url
+        )
+
     try:
         resp = httpx.post(
             url,
-            json=payload,
+            content=body,
+            headers=headers,
             timeout=10.0,  # short — fire-and-forget
         )
         resp.raise_for_status()

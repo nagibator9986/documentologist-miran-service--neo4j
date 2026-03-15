@@ -44,6 +44,19 @@ def _get_cross_encoder():
     raise RuntimeError("No cross-encoder model could be loaded.")
 
 
+def prewarm_cross_encoder() -> None:
+    """Load the cross-encoder model at startup so the first request isn't slow.
+
+    Non-fatal — if loading fails here, the reranker falls back to cosine order
+    and the error is already logged inside _get_cross_encoder().
+    """
+    try:
+        _get_cross_encoder()
+        logger.info("Cross-encoder pre-warmed successfully.")
+    except Exception as exc:
+        logger.warning("Cross-encoder pre-warm failed (non-critical): %s", exc)
+
+
 @tool
 def reranker(query: str, documents: list[dict[str, Any]], top_k: int = 5) -> list[dict[str, Any]]:
     """Rerank documents by relevance to the query using a multilingual cross-encoder.

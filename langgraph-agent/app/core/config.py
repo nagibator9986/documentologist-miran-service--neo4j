@@ -117,8 +117,11 @@ class Settings(BaseSettings):
     reranker_max_content: int = 1024
 
     # ── Search pipeline tuning ────────────────────────────────────────
-    # Minimum sigmoid-normalised rerank score to consider context reliable
-    search_min_confidence: float = 0.25
+    # Minimum sigmoid-normalised rerank score to consider context reliable.
+    # 0.25 (old default) allowed low-quality context and increased hallucination risk.
+    # 0.40 is a safer baseline: the cross-encoder must be reasonably confident
+    # before the LLM is given the context. Override in .env if recall matters more.
+    search_min_confidence: float = 0.40
     # Seconds before parallel graph-enrichment step times out
     graph_enrichment_timeout: float = 8.0
     # num_predict for supervisor intent LLM call (only need 1-2 words out)
@@ -178,6 +181,27 @@ class Settings(BaseSettings):
     mlflow_experiment_name: str = "miran-agent"
 
 
-@lru_cache
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Return the cached Settings singleton.
+
+    In production the .env file is loaded once at startup and never changes —
+    the cache is intentional and has no observable downside.
+
+    In tests, call `clear_settings_cache()` after patching env vars to force
+    a fresh Settings() load.
+    """
     return Settings()
+
+
+def clear_settings_cache() -> None:
+    """Invalidate the settings cache so the next call re-reads the environment.
+
+    Use in unit/integration tests that patch environment variables:
+
+        def test_something(monkeypatch):
+            monkeypatch.setenv("OLLAMA_MODEL", "mistral:latest")
+            clear_settings_cache()
+            assert get_settings().ollama_model == "mistral:latest"
+    """
+    get_settings.cache_clear()

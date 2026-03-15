@@ -56,11 +56,9 @@ def test_upload_duplicate_returns_existing_document(client, monkeypatch):
     service.create_document = AsyncMock()
 
     minio = MagicMock()
-    trigger_flow = MagicMock()
 
     monkeypatch.setattr(routes_module, "DocumentService", lambda db: service)
     monkeypatch.setattr(routes_module, "get_minio_service", lambda: minio)
-    monkeypatch.setattr(routes_module, "_trigger_prefect_flow", trigger_flow)
 
     response = client.post(
         "/api/v1/upload",
@@ -73,10 +71,9 @@ def test_upload_duplicate_returns_existing_document(client, monkeypatch):
     assert body["is_duplicate"] is True
     service.create_document.assert_not_called()
     minio.upload_source_file.assert_not_called()
-    trigger_flow.assert_not_called()
 
 
-def test_upload_new_document_stores_file_and_triggers_flow(client, monkeypatch):
+def test_upload_new_document_stores_file(client, monkeypatch):
     doc_id = uuid.uuid4()
     created_doc = SimpleNamespace(id=doc_id, status=DocumentStatus.PENDING)
 
@@ -87,11 +84,9 @@ def test_upload_new_document_stores_file_and_triggers_flow(client, monkeypatch):
 
     minio = MagicMock()
     minio.upload_source_file = MagicMock(return_value="hash123/contract.pdf")
-    trigger_flow = MagicMock()
 
     monkeypatch.setattr(routes_module, "DocumentService", lambda db: service)
     monkeypatch.setattr(routes_module, "get_minio_service", lambda: minio)
-    monkeypatch.setattr(routes_module, "_trigger_prefect_flow", trigger_flow)
 
     response = client.post(
         "/api/v1/upload",
@@ -104,7 +99,6 @@ def test_upload_new_document_stores_file_and_triggers_flow(client, monkeypatch):
     assert body["is_duplicate"] is False
     minio.upload_source_file.assert_called_once()
     service.create_document.assert_awaited_once()
-    trigger_flow.assert_called_once()
 
 
 def test_upload_rolls_back_when_storage_upload_fails(client, monkeypatch):
@@ -120,12 +114,10 @@ def test_upload_rolls_back_when_storage_upload_fails(client, monkeypatch):
     minio.build_source_path = MagicMock(return_value="hash123/contract.pdf")
     minio.upload_source_file = MagicMock(side_effect=RuntimeError("minio down"))
     minio.delete_source_file = MagicMock()
-    trigger_flow = MagicMock()
 
     monkeypatch.setattr(routes_module, "compute_sha256", lambda _: "hash123")
     monkeypatch.setattr(routes_module, "DocumentService", lambda db: service)
     monkeypatch.setattr(routes_module, "get_minio_service", lambda: minio)
-    monkeypatch.setattr(routes_module, "_trigger_prefect_flow", trigger_flow)
 
     response = client.post(
         "/api/v1/upload",
@@ -136,7 +128,6 @@ def test_upload_rolls_back_when_storage_upload_fails(client, monkeypatch):
     assert DummyDBSession.last_instance is not None
     assert DummyDBSession.last_instance.rollback_calls >= 1
     minio.delete_source_file.assert_not_called()
-    trigger_flow.assert_not_called()
 
 
 def test_upload_deletes_source_when_commit_fails(client, monkeypatch):
@@ -152,13 +143,11 @@ def test_upload_deletes_source_when_commit_fails(client, monkeypatch):
     minio.build_source_path = MagicMock(return_value="hash123/contract.pdf")
     minio.upload_source_file = MagicMock(return_value="hash123/contract.pdf")
     minio.delete_source_file = MagicMock()
-    trigger_flow = MagicMock()
 
     DummyDBSession.fail_commit = True
     monkeypatch.setattr(routes_module, "compute_sha256", lambda _: "hash123")
     monkeypatch.setattr(routes_module, "DocumentService", lambda db: service)
     monkeypatch.setattr(routes_module, "get_minio_service", lambda: minio)
-    monkeypatch.setattr(routes_module, "_trigger_prefect_flow", trigger_flow)
 
     response = client.post(
         "/api/v1/upload",
@@ -168,7 +157,6 @@ def test_upload_deletes_source_when_commit_fails(client, monkeypatch):
 
     assert response.status_code == 500
     minio.delete_source_file.assert_called_once_with("hash123/contract.pdf")
-    trigger_flow.assert_not_called()
 
 
 def test_upload_rejects_file_when_size_exceeds_limit(client, monkeypatch):
@@ -200,11 +188,9 @@ def test_upload_handles_unique_hash_race_as_duplicate(client, monkeypatch):
 
     minio = MagicMock()
     minio.upload_source_file = MagicMock(return_value="hash123/contract.pdf")
-    trigger_flow = MagicMock()
 
     monkeypatch.setattr(routes_module, "DocumentService", lambda db: service)
     monkeypatch.setattr(routes_module, "get_minio_service", lambda: minio)
-    monkeypatch.setattr(routes_module, "_trigger_prefect_flow", trigger_flow)
 
     response = client.post(
         "/api/v1/upload",
@@ -216,4 +202,3 @@ def test_upload_handles_unique_hash_race_as_duplicate(client, monkeypatch):
     assert body["doc_id"] == str(doc_id)
     assert body["is_duplicate"] is True
     service.mark_duplicate.assert_awaited_once()
-    trigger_flow.assert_not_called()

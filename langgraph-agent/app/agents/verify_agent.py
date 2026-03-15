@@ -60,16 +60,24 @@ def _fetch_document_content(state: AgentState, query: str) -> str:
 
 # ── Stage 2: Legal context aggregation ───────────────────────────────────────
 
-def _fetch_legal_context(query: str) -> tuple[str, str, str]:
+def _fetch_legal_context(query: str, state: AgentState | None = None) -> tuple[str, str, str]:
     """Gather applicable norms from Qdrant and Neo4j.
+
+    Reuses state["reranked_docs"] from a prior search agent pass (multi-intent)
+    to avoid redundant Qdrant calls when search already ran in the same turn.
 
     Returns:
         (legal_context, graph_context, obl_context) — all formatted as strings.
     """
-    legal_hits = qdrant_search.invoke({"query": query, "limit": 5})
+    prior_docs = (state or {}).get("reranked_docs") or []
+    if prior_docs:
+        legal_hits = prior_docs
+        logger.info("verify: reusing %d reranked_docs from search agent", len(legal_hits))
+    else:
+        legal_hits = qdrant_search.invoke({"query": query, "limit": 5})
     legal_context = "\n".join(
         f"- {h.get('content', '')[:400]}" for h in legal_hits
-    )
+    ) or "нет данных"
 
     graph_parts: list[str] = []
     try:
@@ -172,11 +180,12 @@ def _parse_verify_result(raw: str) -> dict:
 # ── Stage 5: Human-readable summary ──────────────────────────────────────────
 
 def _format_summary(result: dict) -> str:
+    # Use `or []` instead of default= to guard against LLM returning null for list fields
     return (
         f"Соответствие: {result['compliant_label']}\n"
         f"Риск-оценка: {result['risk_score']}/10\n"
-        f"Проблемы: {'; '.join(result.get('issues', []))}\n"
-        f"Рекомендации: {'; '.join(result.get('fix_hints', []))}"
+        f"Проблемы: {'; '.join(result.get('issues') or [])}\n"
+        f"Рекомендации: {'; '.join(result.get('fix_hints') or [])}"
     )
 
 
@@ -188,7 +197,7 @@ def verify_node(state: AgentState) -> AgentState:
     query = state["user_query"]
 
     doc_content = _fetch_document_content(state, query)
-    legal_context, graph_context, obl_context = _fetch_legal_context(query)
+    legal_context, graph_context, obl_context = _fetch_legal_context(query, state)
     raw = _run_compliance_llm(doc_content, legal_context, graph_context, obl_context, state)
     verify_result = _parse_verify_result(raw)
     summary = _format_summary(verify_result)

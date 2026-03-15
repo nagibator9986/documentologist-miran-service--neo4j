@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -32,22 +34,58 @@ from ..tools.qdrant_search import qdrant_search
 
 logger = logging.getLogger(__name__)
 
-# Task classification stems (Russian morphology)
-_COMPARE_STEMS = [r"сравн", r"отличи[ея]", r"разниц", r"различи[ея]"]
-_EXTRACT_STEMS = [r"извлек", r"вытащ", r"выдел[и]", r"найди все", r"укажи все", r"перечисл"]
-_SUMMARY_STEMS = [r"резюм", r"суммар", r"кратк", r"суммаризу"]
+# ── Module-level thread pool for parallel Neo4j queries ──────────────────────
+_analyze_pool: ThreadPoolExecutor | None = None
+_analyze_pool_lock = threading.Lock()
+
+
+def _get_analyze_pool() -> ThreadPoolExecutor:
+    global _analyze_pool
+    if _analyze_pool is None:
+        with _analyze_pool_lock:
+            if _analyze_pool is None:
+                _analyze_pool = ThreadPoolExecutor(
+                    max_workers=3, thread_name_prefix="analyze-ctx"
+                )
+    return _analyze_pool
+
+
+def shutdown_analyze_pool() -> None:
+    """Gracefully shut down the analyze context thread pool. Call on app shutdown."""
+    global _analyze_pool
+    with _analyze_pool_lock:
+        if _analyze_pool is not None:
+            _analyze_pool.shutdown(wait=True, cancel_futures=False)
+            _analyze_pool = None
+            logger.info("Analyze context thread pool shut down.")
+
+
+# Task classification patterns (Russian morphology) — pre-compiled for performance.
+# re.search() on a pattern string recompiles on every call; using compiled
+# Pattern objects avoids that overhead when _detect_task is called per request.
+_COMPARE_RE = re.compile(
+    r"сравн|отличи[ея]|разниц|различи[ея]",
+    re.IGNORECASE | re.UNICODE,
+)
+_EXTRACT_RE = re.compile(
+    r"извлек|вытащ|выдел[и]|найди все|укажи все|перечисл",
+    re.IGNORECASE | re.UNICODE,
+)
+_SUMMARY_RE = re.compile(
+    r"резюм|суммар|кратк|суммаризу",
+    re.IGNORECASE | re.UNICODE,
+)
 
 
 # ── Stage 1: Task classification ─────────────────────────────────────────────
 
 def _detect_task(query: str) -> str:
     """Return one of: compare, extract, summary, qa (default)."""
-    q = query.lower()
-    if any(re.search(s, q) for s in _COMPARE_STEMS):
+    if _COMPARE_RE.search(query):
         return "compare"
-    if any(re.search(s, q) for s in _EXTRACT_STEMS):
+    if _EXTRACT_RE.search(query):
         return "extract"
-    if any(re.search(s, q) for s in _SUMMARY_STEMS):
+    if _SUMMARY_RE.search(query):
         return "summary"
     return "qa"
 
@@ -73,50 +111,73 @@ def _enrich_search_query(query: str, state: AgentState) -> tuple[str, str | None
 def _fetch_context(
     search_query: str, task: str
 ) -> tuple[str, str, str, list[dict]]:
-    """Gather document context from Qdrant and Neo4j.
+    """Gather document context from Qdrant and Neo4j in parallel.
+
+    Runs up to 3 I/O tasks concurrently:
+      - Qdrant vector search
+      - Neo4j section search (always)
+      - Neo4j entity lookup (only for qa/extract tasks)
 
     Returns:
         (qdrant_chunks_str, graph_sections_str, entity_context_str, raw_hits)
     """
-    hits = qdrant_search.invoke({"query": search_query, "limit": 6})
+    needs_entities = task in ("extract", "qa")
+    term = " ".join(search_query.split()[:5])
+
+    def _qdrant() -> list[dict]:
+        return qdrant_search.invoke({"query": search_query, "limit": 6})
+
+    def _sections() -> list[dict]:
+        return graph_section_search.invoke({"keywords": search_query[:80], "limit": 3})
+
+    def _entities() -> list[dict]:
+        if not needs_entities:
+            return []
+        return graph_entity_lookup.invoke({"text": term[:60], "limit": 5})
+
+    pool = _get_analyze_pool()
+    task_map = {"qdrant": _qdrant, "sections": _sections, "entities": _entities}
+    futures = {pool.submit(fn): name for name, fn in task_map.items()}
+    raw: dict[str, list[dict]] = {k: [] for k in task_map}
+
+    for future in as_completed(futures, timeout=15):
+        name = futures[future]
+        try:
+            raw[name] = future.result()
+        except Exception as exc:
+            logger.warning("analyze: %s lookup failed: %s", name, exc)
+
+    # ── Format Qdrant results ─────────────────────────────────────────────────
+    hits = raw["qdrant"]
     qdrant_chunks = "\n\n".join(
         f"[{i + 1}] {h.get('content', '')[:500]}" for i, h in enumerate(hits)
     )
 
+    # ── Format graph section results ──────────────────────────────────────────
     graph_parts: list[str] = []
-    try:
-        sections = graph_section_search.invoke({"keywords": search_query[:80], "limit": 3})
-        for sec in sections:
-            text = (sec.get("text") or "")[:400]
-            articles = sec.get("articles") or []
-            refs = ", ".join(
-                f"Статья {a.get('number')}" + (f" «{a.get('title')}»" if a.get("title") else "")
-                for a in articles if a.get("number")
-            )
-            entry = text + (f"\n[Статьи: {refs}]" if refs else "")
-            graph_parts.append(entry)
-    except Exception as exc:
-        logger.warning("analyze: graph section search failed: %s", exc)
-
+    for sec in raw["sections"]:
+        text = (sec.get("text") or "")[:400]
+        articles = sec.get("articles") or []
+        refs = ", ".join(
+            f"Статья {a.get('number')}" + (f" «{a.get('title')}»" if a.get("title") else "")
+            for a in articles if a.get("number")
+        )
+        entry = text + (f"\n[Статьи: {refs}]" if refs else "")
+        graph_parts.append(entry)
     graph_context = "\n".join(graph_parts) or "нет данных"
 
+    # ── Format entity results ─────────────────────────────────────────────────
     entity_parts: list[str] = []
-    if task in ("extract", "qa"):
-        try:
-            term = " ".join(search_query.split()[:5])
-            ents = graph_entity_lookup.invoke({"text": term[:60], "limit": 5})
-            for ent in ents:
-                line = f"{ent.get('text')} [{ent.get('label')}]"
-                if ent.get("role"):
-                    line += f" роль: {ent['role']}"
-                docs = ent.get("documents") or []
-                if docs:
-                    line += f" — из: {', '.join(docs[:2])}"
-                entity_parts.append(line)
-        except Exception as exc:
-            logger.warning("analyze: entity lookup failed: %s", exc)
-
+    for ent in raw["entities"]:
+        line = f"{ent.get('text')} [{ent.get('label')}]"
+        if ent.get("role"):
+            line += f" роль: {ent['role']}"
+        docs = ent.get("documents") or []
+        if docs:
+            line += f" — из: {', '.join(docs[:2])}"
+        entity_parts.append(line)
     entity_context = "\n".join(f"- {e}" for e in entity_parts) or "нет данных"
+
     return qdrant_chunks, graph_context, entity_context, hits
 
 
