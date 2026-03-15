@@ -11,13 +11,15 @@ from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # ── Database ────────────────────────────
-    database_url: str = "postgresql+asyncpg://docolog:docolog_secret@localhost:5433/documentolog"
-    database_url_sync: str = "postgresql://docolog:docolog_secret@localhost:5433/documentolog"
+    # Must be overridden via DATABASE_URL / DATABASE_URL_SYNC env vars in production.
+    database_url: str = "postgresql+asyncpg://miran:changeme@localhost:5432/ocr_service"
+    database_url_sync: str = "postgresql://miran:changeme@localhost:5432/ocr_service"
 
     # ── MinIO ───────────────────────────────
     minio_endpoint: str = "localhost:9000"
+    # Must be overridden via MINIO_ACCESS_KEY / MINIO_SECRET_KEY in production.
     minio_access_key: str = "minioadmin"
-    minio_secret_key: str = "minioadmin123"
+    minio_secret_key: str = "minioadmin"
     minio_secure: bool = False
 
     # ── Buckets ─────────────────────────────
@@ -46,6 +48,12 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
     cors_allow_credentials: bool = True
 
+    # ── Rate limiting ────────────────────────
+    # When set, SlowAPI uses Redis for rate limit counters — required for
+    # multi-replica deployments. Leave empty to fall back to in-memory storage
+    # (fine for single-replica). Format: redis://host:port[/db]
+    redis_url: str = ""
+
     # ── Integration: bank_knowledge indexer ──────────────────────────────────
     # URL банковского индексатора. После завершения OCR worker делает POST сюда,
     # чтобы запустить цепочку: chunk → embed → Qdrant + Neo4j.
@@ -57,6 +65,10 @@ class Settings(BaseSettings):
     # Example (matching the webhook service above):
     #   INDEXER_STATUS_URL=http://bank-knowledge:8002/api/v1/index
     indexer_status_url: str = ""
+    # Shared HMAC-SHA256 secret for webhook request signing.
+    # Must match WEBHOOK_SECRET in the bank_knowledge service.
+    # Leave empty to disable signature header (not recommended for production).
+    webhook_secret: str = ""
 
     @field_validator("cors_origins", mode="before")
     @classmethod

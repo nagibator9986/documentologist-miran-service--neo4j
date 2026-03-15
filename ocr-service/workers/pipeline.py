@@ -10,17 +10,22 @@ Steps:
 """
 
 import json
+import threading
 import uuid
 
 from loguru import logger
 from prefect import flow, task
-from prefect.concurrency.sync import concurrency as concurrency_context
 
 from app.core.config import get_settings
 from app.core.database import get_sync_db
 from app.models.document import DocumentStatus
 
 settings = get_settings()
+
+# In-process semaphore: limits concurrent OCR jobs to ocr_concurrency_limit.
+# Using threading.Semaphore instead of Prefect's concurrency context so that
+# the worker has zero dependency on a running Prefect API server.
+_OCR_SEMAPHORE = threading.Semaphore(settings.ocr_concurrency_limit)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -106,7 +111,7 @@ def task_ocr_analysis(ctx: dict) -> dict:
     file_bytes = minio.download_source_file(s3_path)
     logger.info(f"[OCR] Downloaded {len(file_bytes)} bytes from MinIO")
 
-    with concurrency_context(settings.ocr_concurrency_slot, occupy=1):
+    with _OCR_SEMAPHORE:
         ocr = get_ocr_service()
         result = ocr.process_document(file_bytes, filename)
 

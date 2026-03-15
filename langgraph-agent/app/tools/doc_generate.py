@@ -47,12 +47,21 @@ def _setup_pdf_font(pdf: "FPDF") -> str:  # type: ignore[name-defined]
                 pdf.add_font("DejaVu", "", real_path, uni=True)
                 pdf.add_font("DejaVu", "B", real_path, uni=True)
                 return "DejaVu"
-    logger.error(
-        "DejaVuSans.ttf not found in any search path — falling back to Helvetica. "
-        "CYRILLIC TEXT WILL NOT RENDER CORRECTLY. "
-        "Fix: install fonts-dejavu-core or place DejaVuSans.ttf in app/tools/fonts/"
+    raise RuntimeError(
+        "DejaVuSans.ttf не найден ни в одном из путей поиска. "
+        "PDF с кириллицей невозможно сгенерировать корректно. "
+        "Решение: установите пакет fonts-dejavu-core (apt-get install -y fonts-dejavu-core) "
+        "или разместите DejaVuSans.ttf в app/tools/fonts/ рядом с этим модулем."
     )
-    return "Helvetica"
+
+
+_TEMPLATES: dict[str, str] = {
+    "contract":    "Составь юридический договор на основе данных: {context}",
+    "letter":      "Составь деловое письмо на основе данных: {context}",
+    "report":      "Составь аналитический отчёт на основе данных: {context}",
+    "summary":     "Составь краткое резюме документа на основе данных: {context}",
+    "law_excerpt": "Изложи выдержку из нормативно-правового акта на основе данных: {context}",
+}
 
 
 @tool
@@ -65,19 +74,21 @@ def doc_generate(template_type: str, context: dict[str, Any]) -> str:
 
     Returns:
         Generated document text.
+
+    Raises:
+        ValueError: If template_type is not one of the known types.
     """
-    templates = {
-        "contract": "Составь юридический договор на основе данных: {context}",
-        "letter": "Составь деловое письмо на основе данных: {context}",
-        "report": "Составь аналитический отчёт на основе данных: {context}",
-        "summary": "Составь краткое резюме документа на основе данных: {context}",
-        "law_excerpt": "Изложи выдержку из нормативно-правового акта на основе данных: {context}",
-    }
-    tpl = templates.get(template_type, templates["report"])
-    prompt = tpl.format(context=str(context))
+    if template_type not in _TEMPLATES:
+        raise ValueError(
+            f"Unknown template_type {template_type!r}. "
+            f"Valid types: {sorted(_TEMPLATES)}"
+        )
+    prompt = _TEMPLATES[template_type].format(context=str(context))
 
     llm = get_llm()
-    return llm.invoke([HumanMessage(content=prompt)]).content
+    result = llm.invoke([HumanMessage(content=prompt)]).content
+    logger.info("doc_generate: template=%s content_len=%d", template_type, len(result))
+    return result
 
 
 @tool

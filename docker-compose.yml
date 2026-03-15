@@ -1,5 +1,3 @@
-version: "3.9"
-
 # ════════════════════════════════════════════════════════════════════════════════
 # Miran Service — unified docker-compose
 #
@@ -19,6 +17,12 @@ x-logging: &default-logging
     max-size: "10m"
     max-file: "3"
 
+x-langgraph-build: &langgraph-build
+  context: ./langgraph-agent
+  dockerfile: Dockerfile
+
+x-langgraph-image: &langgraph-image miran-service-langgraph-agent:latest
+
 services:
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -34,12 +38,12 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
       POSTGRES_DB: postgres
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-miran}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-miran} -d postgres"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -57,8 +61,8 @@ services:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY must be set}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY must be set}
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:9002:9000"
+      - "127.0.0.1:9003:9001"
     volumes:
       - minio_data:/data
     healthcheck:
@@ -95,13 +99,19 @@ services:
     image: redis:7-alpine
     container_name: miran-redis
     restart: unless-stopped
-    command: redis-server --appendonly yes --loglevel warning
+    # Supports optional password via REDIS_PASSWORD env var.
+    # If REDIS_PASSWORD is set, adds --requirepass; otherwise runs unauthenticated.
+    command: >
+      sh -c "exec redis-server --appendonly yes --loglevel warning
+      $$(test -n \"$$REDIS_PASSWORD\" && echo \"--requirepass $$REDIS_PASSWORD\")"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:6380:6379"
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli $${REDIS_PASSWORD:+-a $$REDIS_PASSWORD} ping"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -115,16 +125,16 @@ services:
     container_name: miran-qdrant
     restart: unless-stopped
     ports:
-      - "127.0.0.1:6333:6333"
-      - "127.0.0.1:6334:6334"
+      - "127.0.0.1:6335:6333"
+      - "127.0.0.1:6336:6334"
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      test: ["CMD", "sh", "-c", "exit 0"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 20s
+      start_period: 5s
     networks:
       - miran-net
     logging: *default-logging
@@ -134,12 +144,12 @@ services:
     container_name: miran-neo4j
     restart: unless-stopped
     ports:
-      - "127.0.0.1:7474:7474"
-      - "127.0.0.1:7687:7687"
+      - "127.0.0.1:7475:7474"
+      - "127.0.0.1:7688:7687"
     environment:
       NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set}
       NEO4J_PLUGINS: '["apoc"]'
-      NEO4J_dbms_memory_heap_maxSize: "1G"
+      NEO4J_server_memory_heap_max__size: "${NEO4J_HEAP_MAX:-2G}"
     volumes:
       - neo4j_data:/data
     healthcheck:
@@ -160,10 +170,16 @@ services:
     environment:
       PREFECT_API_DATABASE_CONNECTION_URL: "postgresql+asyncpg://${POSTGRES_USER:-miran}:${POSTGRES_PASSWORD}@postgres:5432/prefect"
     ports:
-      - "127.0.0.1:4200:4200"
+      - "127.0.0.1:4201:4200"
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health', timeout=5)\" || exit 1"]
+      interval: 10s
+      timeout: 8s
+      retries: 12
+      start_period: 30s
     networks:
       - miran-net
     logging: *default-logging
@@ -201,7 +217,7 @@ services:
       minio:
         condition: service_healthy
       prefect-server:
-        condition: service_started
+        condition: service_healthy
     networks:
       - miran-net
     logging: *default-logging
@@ -212,6 +228,12 @@ services:
       dockerfile: Dockerfile.worker
     container_name: miran-ocr-worker
     restart: unless-stopped
+    # Surya OCR models + PyTorch buffers need headroom.
+    # mem_limit caps RSS so Docker emits a clean OOM error instead of the
+    # Linux kernel OOM killer silently sending SIGKILL (exit 137).
+    # memswap_limit allows up to 1 GB of swap before hard-killing the process.
+    mem_limit: ${OCR_WORKER_MEM_LIMIT:-5g}
+    memswap_limit: ${OCR_WORKER_MEMSWAP_LIMIT:-6g}
     environment:
       DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-miran}:${POSTGRES_PASSWORD}@postgres:5432/ocr_service"
       DATABASE_URL_SYNC: "postgresql://${POSTGRES_USER:-miran}:${POSTGRES_PASSWORD}@postgres:5432/ocr_service"
@@ -232,7 +254,31 @@ services:
       minio:
         condition: service_healthy
       prefect-server:
+        condition: service_healthy
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  # Step 1.5: OCR Frontend — Streamlit UI for uploads and document browsing
+  ocr-frontend:
+    build:
+      context: ./ocr-service
+      dockerfile: Dockerfile.frontend
+    container_name: miran-ocr-frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${OCR_FRONTEND_PORT:-8504}:8501"
+    environment:
+      API_BASE_URL: "http://ocr-api:8000/api/v1"
+    depends_on:
+      ocr-api:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8501', timeout=5)\" >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     networks:
       - miran-net
     logging: *default-logging
@@ -279,11 +325,46 @@ services:
       - miran-net
     logging: *default-logging
 
+  bank-knowledge-ui:
+    build:
+      context: ./bank_knowledge
+      dockerfile: Dockerfile
+    container_name: miran-bank-knowledge-ui
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${BANK_KNOWLEDGE_UI_PORT:-8505}:8080"
+    environment:
+      STREAMLIT_SERVER_HOST: "0.0.0.0"
+      STREAMLIT_SERVER_PORT: "8080"
+      QDRANT_URL: "http://qdrant:6333"
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-bank_knowledge}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-bge-m3:latest}
+      VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-1024}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080', timeout=5)\" >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - miran-net
+    logging: *default-logging
+
   # Step 3: LangGraph Agent — multi-agent RAG
   langgraph-agent:
-    build:
-      context: ./langgraph-agent
-      dockerfile: Dockerfile
+    image: *langgraph-image
+    build: *langgraph-build
     container_name: miran-langgraph-agent
     restart: unless-stopped
     ports:
@@ -335,8 +416,47 @@ services:
         condition: service_started
       ocr-api:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
     volumes:
       - agent_exports:/exports
+    networks:
+      - miran-net
+    logging: *default-logging
+
+  # Step 4: Chainlit UI — LLM-native chat interface for the agent
+  chainlit-ui:
+    image: *langgraph-image
+    build: *langgraph-build
+    container_name: miran-chainlit-ui
+    restart: unless-stopped
+    command:
+      - chainlit
+      - run
+      - chainlit_app.py
+      - --headless
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8501"
+    ports:
+      - "127.0.0.1:${CHAINLIT_PORT:-8501}:8501"
+    environment:
+      AGENT_URL: "http://langgraph-agent:8001"
+      DEBUG: "false"
+    depends_on:
+      langgraph-agent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8501 >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - miran-net
     logging: *default-logging
