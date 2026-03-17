@@ -30,10 +30,13 @@ class Settings(BaseSettings):
     ollama_url: str = "http://localhost:11434"
     # qwen2.5:7b handles Russian + structured JSON far better than mistral:latest.
     # Alternatives: llama3.1:8b, mistral-nemo (prod API), mistral:latest (weakest).
-    ollama_model: str = "qwen2.5:7b"
+    ollama_model: str = "qwen2.5:14b"
+    # Faster model for bulk text generation (e.g. document draft expansion).
+    # When empty, falls back to ollama_model.
+    ollama_generate_draft_model: str = ""
     ollama_embedding_model: str = "bge-m3:latest"
     # Seconds before an Ollama request times out
-    ollama_timeout: int = 120
+    ollama_timeout: int = 300
     # Max retries for Ollama LLM calls (tenacity, exponential backoff)
     ollama_max_retries: int = 3
 
@@ -84,7 +87,7 @@ class Settings(BaseSettings):
     bank_knowledge_upload_dir: str = ""
 
     # ── Agent behaviour ───────────────────────────────────────────────
-    rerank_top_k: int = 5
+    rerank_top_k: int = 7
     bm25_top_k: int = 40
     max_tokens_response: int = 2048
     temperature: float = 0.1
@@ -103,7 +106,7 @@ class Settings(BaseSettings):
     # Max significant words extracted from long queries for Neo4j graph search
     graph_kw_max_words: int = 10
     # Max characters of content included in context window per chunk
-    content_snippet_max_len: int = 800
+    content_snippet_max_len: int = 1200
     # Max characters of content shown in citation preview
     citation_preview_max_len: int = 200
 
@@ -159,9 +162,27 @@ class Settings(BaseSettings):
     sse_word_chunk_size: int = 6
 
     # ── Reranking ─────────────────────────────────────────────────────
-    # Multiplier applied to rerank_top_k to form the candidate pool size
-    # before cross-encoder scoring (higher = better recall, more CPU)
+    # Hard candidate pool fed to the cross-encoder before top_k selection.
+    # Replaces the old rerank_top_k * 2 magic: 30 covers all merged hits
+    # (vector 40 + BM25 40 + graph ~10, deduplicated to ~45) without waste.
+    rerank_candidate_pool: int = 30
+    # Kept for any external callers that still reference this setting.
     rerank_candidate_multiplier: int = 2
+
+    # ── Analyze agent ─────────────────────────────────────────────────
+    # Number of Qdrant hits for summary tasks (needs broad coverage).
+    analyze_summary_limit: int = 15
+    # Number of Qdrant hits per document side in compare tasks.
+    analyze_compare_limit: int = 8
+
+    # ── Memory agent ───────────────────────────────────────────────────
+    # How many messages to load from Redis into state["messages"] at the
+    # start of each request.  Intentionally larger than history_turns*2:
+    # the full loaded set is also scanned by extract_recent_filename()
+    # (needs to find filenames mentioned N turns ago) and other referential
+    # resolution logic.  build_history_messages() still caps what reaches
+    # the LLM at history_turns turns.
+    memory_max_history: int = 20
 
     # ── Graph query thread pool ───────────────────────────────────────
     # Worker threads for parallel Neo4j queries inside _retrieve_graph.
@@ -169,13 +190,16 @@ class Settings(BaseSettings):
     graph_pool_workers: int = 5
 
     # ── MLflow Observability ──────────────────────────────────────────
-    # Set MLFLOW_ENABLED=true in .env to enable tracing.
-    # When false all tracing code is a no-op — zero overhead.
-    mlflow_enabled: bool = False
+    # MLflow tracing is enabled by default.
+    # Set MLFLOW_ENABLED=false in .env to disable (zero overhead when off).
+    mlflow_enabled: bool = True
     # MLflow tracking server URL (docker-compose: http://mlflow:5000)
     mlflow_tracking_uri: str = "http://localhost:5000"
     # Experiment groups all runs for this service together in the UI
     mlflow_experiment_name: str = "miran-agent"
+
+    # Log format: "text" for human-readable, "json" for structured production logs
+    log_format: str = "text"
 
 
 @lru_cache

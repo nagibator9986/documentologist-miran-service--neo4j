@@ -55,8 +55,8 @@ services:
       TEMPERATURE: ${TEMPERATURE:-0.1}
       MIN_RELEVANCE_SCORE: ${MIN_RELEVANCE_SCORE:-0.5}
 
-      # MLflow observability (disabled by default — set MLFLOW_ENABLED=true to activate)
-      MLFLOW_ENABLED: ${MLFLOW_ENABLED:-false}
+      # MLflow observability (enabled by default — set MLFLOW_ENABLED=false to disable)
+      MLFLOW_ENABLED: ${MLFLOW_ENABLED:-true}
       MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
       MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-miran-agent}
 
