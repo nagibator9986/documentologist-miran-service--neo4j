@@ -15,6 +15,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from .api.v1.chat import router as chat_router
+from .api.v1.debug import router as debug_router
 from .api.v1.documents import router as documents_router
 from .api.v1.ingest import router as ingest_router
 from .api.v1.sessions import router as sessions_router
@@ -106,6 +107,7 @@ def create_app() -> FastAPI:
 
     # ── Routers ──────────────────────────────────────────────────────
     app.include_router(chat_router, prefix="/api/v1")
+    app.include_router(debug_router, prefix="/api/v1")
     app.include_router(documents_router, prefix="/api/v1")
     app.include_router(ingest_router, prefix="/api/v1")
     app.include_router(sessions_router, prefix="/api/v1")
