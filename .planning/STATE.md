@@ -2,31 +2,32 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: unknown
-stopped_at: Completed 01-02-PLAN.md
-last_updated: "2026-03-17T10:01:51.444Z"
+status: in-progress
+stopped_at: Completed 01-03-PLAN.md
+last_updated: "2026-03-17T10:23:06Z"
 progress:
   total_phases: 5
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 3
-  completed_plans: 2
+  completed_plans: 3
 ---
 
 # Project State
 
 ## Current Status
-**Phase:** Phase 1 — Observability & Eval Infrastructure (Plan 3 of 3)
+**Phase:** Phase 1 COMPLETE — Observability & Eval Infrastructure
 **Milestone:** 1 — Production-Ready Agent System
 **Date:** 2026-03-17
 
 ## Active Work
-Phase 1, Plan 03 — Eval harness and CI integration
+Phase 1 complete. Ready for Phase 2 — JSON Reliability Fix.
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
 - [x] Codebase analysis — all 5 agents read, architecture understood
 - [x] Phase 1 Plan 01 — MLflow config, structured logging, tier in AgentState (commits: 3b66625, 8d2d3fd, 62a519d)
 - [x] Phase 1 Plan 02 — Eval dataset (31 queries) + debug retrieval endpoint (commits: aab9bae, 779c2a7)
+- [x] Phase 1 Plan 03 — Agent metrics enrichment + eval runner script (commits: 13ffc3e, dff09eb)
 
 ## Key Decisions
 - **No rewrite** — evolutionary improvement of existing agents
@@ -37,6 +38,8 @@ Phase 1, Plan 03 — Eval harness and CI integration
 - **tier in AgentState not just logs** — enables programmatic access by downstream agents and eval scripts
 - **BM25 debug re-scores vector hits** — bm25_search requires a documents list input, not a standalone index
 - **Debug endpoint uses tools directly** — decoupled from search_agent internals for independent diagnostics
+- **supervisor retrieval_metrics overwritten by downstream agent** — acceptable since each pipeline node replaces previous metrics
+- **json_parse_success=None for analyze qa/summary** — these tasks produce free text, not JSON
 
 ## Critical Context
 - Код находится в: `documentologist-miran-service--neo4j/langgraph-agent/`
@@ -45,9 +48,11 @@ Phase 1, Plan 03 — Eval harness and CI integration
 - Промпты: `app/prompts/` (не читались — нужно проверить в Phase 2)
 - JSON агенты используют `get_json_llm` из `app/core/llm.py` — нужно проверить реализацию
 - Structured logging: `app/core/logging_config.py` — setup_logging(log_level, log_format)
+- Eval dataset: `tests/eval/dataset.json` (31 queries)
+- Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Completed 01-02-PLAN.md
+Stopped at: Completed 01-03-PLAN.md
 
 ## Next Action
-Execute 01-03-PLAN.md — Eval harness and CI integration.
+Execute Phase 2 — JSON Reliability Fix (parse_with_retry, Pydantic schemas, prompt fixes).

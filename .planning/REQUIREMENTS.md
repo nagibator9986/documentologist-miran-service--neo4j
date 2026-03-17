@@ -14,22 +14,22 @@
 - Пороги `min_relevance_score` и `search_min_confidence` должны быть откалиброваны так, чтобы не срезать релевантные результаты
 - Диагностический endpoint `/api/v1/debug/retrieval` — показывает scores всех retrieval stages
 
-### FR-3: Supervisor Routing Accuracy
-- Keyword-based routing покрывает ≥ 85% типовых запросов
-- LLM fallback покрывает оставшиеся edge cases
-- Добавить логирование: какой tier сработал + финальный intent
+### FR-3: Supervisor Routing Accuracy [COMPLETE - Phase 1]
+- [x] Keyword-based routing покрывает ≥ 85% типовых запросов
+- [x] LLM fallback покрывает оставшиеся edge cases
+- [x] Добавить логирование: какой tier сработал + финальный intent
 
-### FR-4: Evaluation Suite
+### FR-4: Evaluation Suite [COMPLETE - Phase 1]
 Набор из ≥ 30 тестовых запросов с ожидаемыми outcomes:
-- Routing tests — ожидаемый agent для каждого запроса
-- Retrieval tests — ожидаемые документы в top-5
-- JSON validity tests — структура ответа для verify/generate/analyze
-- Answer quality tests — ответ содержит ключевые факты (не hallucination)
+- [x] Routing tests — ожидаемый agent для каждого запроса
+- [x] Retrieval tests — ожидаемые документы в top-5
+- [x] JSON validity tests — структура ответа для verify/generate/analyze
+- [ ] Answer quality tests — ответ содержит ключевые факты (не hallucination)
 
-### FR-5: Observability
-- MLflow включён в docker-compose по умолчанию
-- Каждый запрос логирует: intent, retrieved_docs_count, best_rerank_score, json_parse_success, elapsed_s
-- Structured logs в JSON format для production
+### FR-5: Observability [COMPLETE - Phase 1]
+- [x] MLflow включён в docker-compose по умолчанию
+- [x] Каждый запрос логирует: intent, retrieved_docs_count, best_rerank_score, json_parse_success, elapsed_s
+- [x] Structured logs в JSON format для production
 
 ### FR-6: Integration Tests
 - `pytest` suite покрывает happy path каждого агента

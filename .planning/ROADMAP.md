@@ -8,12 +8,12 @@
 
 ## Phase 1: Observability & Eval Infrastructure
 **Goal:** Создать измерительную инфраструктуру — невозможно чинить то, что нельзя измерить.
-**Plans:** 2/3 plans executed
+**Plans:** 3/3 plans executed (COMPLETE)
 
 Plans:
 - [x] 01-01-PLAN.md — MLflow config, structured logging, tier in AgentState
-- [ ] 01-02-PLAN.md — Eval dataset (30+ queries), debug retrieval endpoint
-- [ ] 01-03-PLAN.md — Agent metrics enrichment, eval runner script
+- [x] 01-02-PLAN.md — Eval dataset (31 queries), debug retrieval endpoint
+- [x] 01-03-PLAN.md — Agent metrics enrichment, eval runner script
 
 ### Tasks
 1. Включить MLflow в `docker-compose.yml` по умолчанию; создать `.env.example` с `MLFLOW_ENABLED=true`
