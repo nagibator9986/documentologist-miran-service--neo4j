@@ -27,8 +27,8 @@ import time
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ..core.config import get_settings
-from ..core.llm import get_json_llm, invoke_with_retry
-from ..core.utils import build_final_response, safe_parse_json, strip_conversational_prefix
+from ..core.json_output import VerifyResult, parse_with_retry
+from ..core.utils import build_final_response, strip_conversational_prefix
 from ..graph.state import AgentState
 from ..prompts import VERIFY_COMPLIANCE
 from ..tools.bm25_search import bm25_search
@@ -196,13 +196,11 @@ def _run_compliance_llm(
     legal_context: str,
     graph_context: str,
     obl_context: str,
-) -> str:
-    """Call LLM to produce compliance JSON.
+) -> tuple[dict, bool]:
+    """Call LLM to produce compliance JSON with schema validation and retry.
 
-    Stateless: no session history. History caused context contamination —
-    answers from prior verify queries bled into the current analysis.
-    Distinguishes pasted documents from described scenarios so the LLM
-    evaluates the right subject.
+    Returns (result_dict, parse_success). On total parse failure, returns
+    the existing fallback dict with _parse_failed=True.
     """
     s = get_settings()
     is_pasted_doc = _is_document_content(doc_content, s.verify_pasted_doc_threshold)
@@ -224,11 +222,26 @@ def _run_compliance_llm(
         f"Релевантные статьи из графа знаний:\n{graph_context}\n\n"
         f"Выявленные обязательства из графа:\n{obl_context}"
     )
-    llm = get_json_llm(num_predict=1024)
-    return invoke_with_retry(llm, [
+
+    messages = [
         SystemMessage(content=VERIFY_COMPLIANCE),
         HumanMessage(content=prompt),
-    ])
+    ]
+
+    result, success = parse_with_retry(messages, VerifyResult, num_predict=2048)
+
+    if success and result is not None:
+        return result.model_dump(), True
+
+    # Total failure: return existing fallback (preserves _parse_failed behavior)
+    return {
+        "compliant": None,
+        "risk_score": None,
+        "issues": [_PARSE_FAILED_RESPONSE],
+        "law_refs": [],
+        "fix_hints": [],
+        "_parse_failed": True,
+    }, False
 
 
 # ── Stage 4: Result normalisation ────────────────────────────────────────────
@@ -239,23 +252,11 @@ _PARSE_FAILED_RESPONSE = (
 )
 
 
-def _parse_verify_result(raw: str) -> dict:
-    """Parse LLM JSON, clamp risk_score to [0,10], enforce compliant consistency.
+def _parse_verify_result(result: dict) -> dict:
+    """Clamp risk_score to [0,10], enforce compliant consistency.
 
-    JSON parse failure: returns a clearly marked fallback instead of the
-    misleading "compliant=Не определено, risk=0" that the original fallback
-    produced (risk_score=-1 clamped to 0 looked like a clean result).
+    Input is already a parsed dict (from parse_with_retry or fallback).
     """
-    fallback = {
-        "compliant": None,
-        "risk_score": None,   # None signals "parse failed", not a real score of 0
-        "issues": [_PARSE_FAILED_RESPONSE],
-        "law_refs": [],
-        "fix_hints": [],
-        "_parse_failed": True,
-    }
-    result = safe_parse_json(raw, fallback)
-
     # Guard: if parse failed, return immediately without clamping/overriding
     if result.get("_parse_failed"):
         result["compliant_label"] = "Не определено"
@@ -350,8 +351,8 @@ def verify_node(state: AgentState) -> AgentState:
 
     doc_content = _fetch_document_content(state, query)
     legal_context, graph_context, obl_context = _fetch_legal_context(query)
-    raw = _run_compliance_llm(doc_content, legal_context, graph_context, obl_context)
-    verify_result = _parse_verify_result(raw)
+    result_dict, _parse_ok = _run_compliance_llm(doc_content, legal_context, graph_context, obl_context)
+    verify_result = _parse_verify_result(result_dict)
     summary = _format_summary(verify_result)
     final_response = build_final_response(summary, state.get("combined_responses") or [])
 
