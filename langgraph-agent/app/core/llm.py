@@ -5,6 +5,7 @@ import logging
 from functools import lru_cache
 
 from langchain_ollama import ChatOllama, OllamaEmbeddings
+from pydantic import BaseModel
 from tenacity import (
     RetryError,
     retry,
@@ -56,6 +57,24 @@ def get_llm(*, temperature: float | None = None, num_predict: int | None = None)
     return llm
 
 
+def get_draft_llm(*, temperature: float | None = None, num_predict: int | None = None) -> ChatOllama:
+    """Return an LLM for bulk document draft expansion.
+
+    Uses ``ollama_generate_draft_model`` when configured (typically a faster,
+    smaller model such as qwen2.5:7b).  Falls back to ``ollama_model`` so the
+    setting is purely optional — removing it from .env has no effect on logic.
+    """
+    s = get_settings()
+    model = s.ollama_generate_draft_model or s.ollama_model
+    return ChatOllama(
+        base_url=s.ollama_url,
+        model=model,
+        temperature=temperature if temperature is not None else s.temperature,
+        num_predict=num_predict or s.max_tokens_response,
+        timeout=s.ollama_timeout,
+    )
+
+
 def get_json_llm(*, num_predict: int | None = None) -> ChatOllama:
     """Return a ChatOllama instance that forces JSON output."""
     s = get_settings()
@@ -68,6 +87,28 @@ def get_json_llm(*, num_predict: int | None = None) -> ChatOllama:
         timeout=s.ollama_timeout,
     )
     return llm
+
+
+def get_schema_llm(
+    schema: type[BaseModel],
+    *,
+    num_predict: int | None = None,
+) -> ChatOllama:
+    """Return a ChatOllama that constrains output to a Pydantic JSON schema.
+
+    Uses Ollama's native structured output (format=schema dict) for
+    grammar-level token constraint. Requires Ollama >= 0.5.0.
+    Falls back to format="json" if schema format is not supported.
+    """
+    s = get_settings()
+    return ChatOllama(
+        base_url=s.ollama_url,
+        model=s.ollama_model,
+        temperature=0.0,
+        num_predict=num_predict or 1024,
+        format=schema.model_json_schema(),
+        timeout=s.ollama_timeout,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
