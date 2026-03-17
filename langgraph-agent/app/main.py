@@ -28,9 +28,14 @@ from .tools.session_memory import pg_ensure_schema_sync, pg_shutdown
 # Logging
 # ──────────────────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+# NOTE: logging is configured before Settings is loaded because Settings is
+# lazy (get_settings() is called later inside lifespan). We therefore read
+# LOG_LEVEL and LOG_FORMAT directly from the environment here.
+from .core.logging_config import setup_logging
+
+setup_logging(
+    log_level=os.getenv("LOG_LEVEL", "INFO"),
+    log_format=os.getenv("LOG_FORMAT", "text"),
 )
 logger = logging.getLogger(__name__)
 
