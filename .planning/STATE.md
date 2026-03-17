@@ -3,24 +3,24 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 02-02-PLAN.md
-last_updated: "2026-03-17T16:15:51.933Z"
+stopped_at: Completed 02-04-PLAN.md
+last_updated: "2026-03-17T16:38:28.904Z"
 progress:
   total_phases: 5
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 7
-  completed_plans: 5
+  completed_plans: 7
 ---
 
 # Project State
 
 ## Current Status
-**Phase:** Phase 2 — JSON Reliability Fix (Plan 2 of 4 complete)
+**Phase:** Phase 2 — JSON Reliability Fix (Plan 4 of 4 complete)
 **Milestone:** 1 — Production-Ready Agent System
 **Date:** 2026-03-17
 
 ## Active Work
-Phase 2 in progress. Plan 02-01 (get_schema_llm) and Plan 02-02 (anti-markdown prompts) complete.
+Phase 2 complete. All 4 plans done: 02-01 (json_output layer), 02-02 (anti-markdown prompts), 02-03 (verify/generate wiring), 02-04 (analyze_agent wiring).
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
@@ -40,6 +40,8 @@ Phase 2 in progress. Plan 02-01 (get_schema_llm) and Plan 02-02 (anti-markdown p
 - **Debug endpoint uses tools directly** — decoupled from search_agent internals for independent diagnostics
 - **supervisor retrieval_metrics overwritten by downstream agent** — acceptable since each pipeline node replaces previous metrics
 - **json_parse_success=None for analyze qa/summary** — these tasks produce free text, not JSON
+- **Removed get_json_llm/safe_parse_json from analyze_agent** — fully replaced by parse_with_retry pipeline
+- **Fallback dict includes _parse_failed=True** — maintains backward compat with json_parse_success metric
 
 ## Critical Context
 - Код находится в: `documentologist-miran-service--neo4j/langgraph-agent/`
@@ -52,7 +54,7 @@ Phase 2 in progress. Plan 02-01 (get_schema_llm) and Plan 02-02 (anti-markdown p
 - Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Completed 02-02-PLAN.md
+Stopped at: Completed 02-04-PLAN.md
 
 ## Next Action
 Execute Phase 2 — JSON Reliability Fix (parse_with_retry, Pydantic schemas, prompt fixes).

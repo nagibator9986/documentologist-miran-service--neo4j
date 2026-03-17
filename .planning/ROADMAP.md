@@ -28,7 +28,7 @@ Plans:
 
 ## Phase 2: JSON Reliability Fix
 **Goal:** JSON parse success ≥ 95% во всех агентах с структурированным выводом.
-**Plans:** 2/4 plans executed
+**Plans:** 4/4 plans complete
 
 Plans:
 - [x] 02-01-PLAN.md — Core JSON output layer (Pydantic schemas + parse_with_retry + get_schema_llm)
