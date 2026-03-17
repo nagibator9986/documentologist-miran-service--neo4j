@@ -18,7 +18,6 @@ Pipeline stages (each is a focused private function):
 """
 from __future__ import annotations
 
-import json as _json
 import logging
 import re
 import threading
@@ -28,12 +27,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ..core.config import Settings, get_settings
-from ..core.llm import get_llm, invoke_with_retry
+from ..core.llm import get_draft_llm, get_llm, invoke_with_retry
 from ..core.utils import (
     DOC_REF_RE,
     build_final_response,
     build_history_messages,
+    extract_hit_filename,
+    extract_hit_page,
     extract_recent_filename,
+    strip_conversational_prefix,
 )
 from ..graph.state import AgentState
 from ..prompts import SEARCH_EXPERT, SEARCH_EXPAND_QUERY
@@ -118,7 +120,6 @@ _RU_STOPWORDS = frozenset([
     "эта", "эти", "того", "тот", "за", "со", "во", "без", "под", "над",
 ])
 
-
 # ── Small data helpers ────────────────────────────────────────────────────────
 
 def _extract_graph_keywords(query: str, max_words: int) -> str:
@@ -126,45 +127,6 @@ def _extract_graph_keywords(query: str, max_words: int) -> str:
     words = re.findall(r"[а-яёА-ЯЁa-zA-Z0-9]+", query)
     significant = [w for w in words if w.lower() not in _RU_STOPWORDS and len(w) >= 3]
     return " ".join(significant[:max_words])
-
-
-def _extract_filename_from_hit(hit: dict) -> str:
-    """Extract the source filename from a Qdrant hit's payload metadata."""
-    meta = hit.get("metadata", {})
-    raw = meta.get("meta_json")
-    if raw:
-        try:
-            inner = _json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(inner, dict) and inner.get("filename"):
-                return str(inner["filename"])
-        except Exception:
-            pass
-    for field in ("title", "filename", "source"):
-        val = meta.get(field, "")
-        if val:
-            return str(val)
-    question = hit.get("question") or meta.get("question", "")
-    if "|" in question:
-        return question.split("|")[0].strip()
-    return ""
-
-
-def _extract_page_num(hit: dict) -> str | None:
-    """Extract page number from a Qdrant hit's payload metadata."""
-    meta = hit.get("metadata", {})
-    pn = meta.get("page_number") or meta.get("page")
-    if pn is not None:
-        return str(pn)
-    raw = meta.get("meta_json")
-    if raw:
-        try:
-            inner = _json.loads(raw) if isinstance(raw, str) else raw
-            pn = inner.get("page_number") or inner.get("page")
-            if pn is not None:
-                return str(pn)
-        except Exception:
-            pass
-    return None
 
 
 # ── Stage 1: Query preparation ────────────────────────────────────────────────
@@ -176,6 +138,9 @@ def _prepare_query(query: str, state: AgentState) -> tuple[str, str]:
         (lexical_query, embed_query) — lexical keeps original wording for BM25;
         embed_query is LLM-rewritten for better semantic recall.
     """
+    # Strip conversational prefixes (imported from utils — shared with analyze).
+    query = strip_conversational_prefix(query)
+
     if DOC_REF_RE.search(query):
         filename = extract_recent_filename(state)
         if filename:
@@ -187,11 +152,15 @@ def _prepare_query(query: str, state: AgentState) -> tuple[str, str]:
 
 
 def _expand_query(query: str) -> str:
-    """LLM rewrite for better semantic retrieval. Non-fatal — returns original on error."""
+    """LLM rewrite for better semantic retrieval. Non-fatal — returns original on error.
+
+    Uses the draft (7b) model — query expansion needs speed, not full reasoning power.
+    Saves 30-60s per request compared to routing this through the 14b model.
+    """
     if len(query) < 15:
         return query
 
-    llm = get_llm(temperature=0.0, num_predict=120)
+    llm = get_draft_llm(temperature=0.0, num_predict=150)
     prompt = SEARCH_EXPAND_QUERY.format(query=query)
     try:
         expanded = invoke_with_retry(
@@ -505,7 +474,7 @@ def _rerank_and_calibrate(
     """
     top_candidates = sorted(
         candidates, key=lambda d: float(d.get("score", 0)), reverse=True
-    )[:s.rerank_top_k * 2]
+    )[:s.rerank_candidate_pool]
 
     reranked = (
         reranker.invoke({"query": query, "documents": top_candidates, "top_k": s.rerank_top_k})
@@ -532,16 +501,24 @@ def _build_llm_prompt(
 ) -> str:
     """Build the user message for the LLM based on retrieval results."""
 
-    def _ctx_snippet(d: dict) -> str:
-        """Return content at full length for exact hits, snippet length otherwise."""
+    def _ctx_block(i: int, d: dict) -> str:
+        """Build a single numbered context block with source header + content."""
+        filename = extract_hit_filename(d) or "—"
+        page = extract_hit_page(d)
+        page_suffix = f", стр. {page}" if page else ""
+        # Exact hits get slightly more content (they were matched literally)
         limit = 1200 if str(d.get("id", "")) in exact_hit_ids else s.content_snippet_max_len
-        return d.get("content", "")[:limit]
+        content = d.get("content", "")[:limit]
+        return (
+            f"[Источник {i + 1}] Документ: {filename}{page_suffix}\n"
+            f"{content}"
+        )
 
     if is_exact and exact_hits:
         exact_blocks = "\n\n".join(
             "─" * 60 + f"\n[Совпадение {i + 1}]\n"
-            f"Документ: {_extract_filename_from_hit(h) or '—'}\n"
-            f"Страница: {_extract_page_num(h) or '?'}\n"
+            f"Документ: {extract_hit_filename(h) or '—'}\n"
+            f"Страница: {extract_hit_page(h) or '?'}\n"
             f"Секция: {h.get('section', '—')}\n"
             f"Найденный фрагмент:\n{h.get('content', '')[:1000]}"
             for i, h in enumerate(exact_hits[:5])
@@ -555,9 +532,7 @@ def _build_llm_prompt(
         )
 
     if has_context:
-        context = "\n\n".join(
-            f"[{i + 1}] {_ctx_snippet(d)}" for i, d in enumerate(reranked)
-        )
+        context = "\n\n".join(_ctx_block(i, d) for i, d in enumerate(reranked))
         return f"Контекст:\n{context}\n\nВопрос: {query}"
 
     # Low-confidence path — honest "not found" rather than hallucination
@@ -598,10 +573,10 @@ def _build_citations(
             "content_preview": d.get("content", "")[:s.citation_preview_max_len],
             "match_content": d.get("content", "") if str(d.get("id", "")) in exact_hit_ids else "",
             "is_exact_match": str(d.get("id", "")) in exact_hit_ids,
-            "page_number": _extract_page_num(d),
+            "page_number": extract_hit_page(d),
             "section": d.get("section", ""),
             "score": d.get("rerank_score", d.get("score", 0)),
-            "filename": _extract_filename_from_hit(d),
+            "filename": extract_hit_filename(d),
             "metadata": d.get("metadata", {}),
         }
         for i, d in enumerate(reranked)
@@ -656,6 +631,8 @@ def search_node(state: AgentState) -> AgentState:
     elapsed = time.perf_counter() - t_start
     metrics = {
         "node": "search",
+        "intent": state.get("intent", ""),
+        "tier": state.get("tier", ""),
         "query_len": len(lexical_query),
         "query_expanded": embed_query != lexical_query,
         "vector_hits": len(vector_hits),

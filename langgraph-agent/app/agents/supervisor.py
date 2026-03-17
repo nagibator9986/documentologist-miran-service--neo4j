@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -154,6 +155,7 @@ def classify_intent(state: AgentState) -> AgentState:
     2. Keyword override   — high-confidence single-intent, zero LLM cost
     3. Draft LLM fallback — 7b model, stateless (no history), for ambiguous queries
     """
+    t_start = time.perf_counter()
     raw_query = state["user_query"]
     # Strip conversational noise before classification so prefixes like
     # "Скажите пожалуйста, ..." don't confuse compound/keyword matching.
@@ -164,6 +166,7 @@ def classify_intent(state: AgentState) -> AgentState:
     #    is not incorrectly collapsed to a single intent.
     for pattern, primary, secondary in _COMPOUND_PATTERNS:
         if pattern.search(q_lower):
+            elapsed = time.perf_counter() - t_start
             logger.info(
                 "Supervisor: compound [%s, %s] query=%r",
                 primary, secondary, query[:80],
@@ -174,11 +177,18 @@ def classify_intent(state: AgentState) -> AgentState:
                 "intents": [primary, secondary],
                 "tier": "compound",
                 "combined_responses": state.get("combined_responses") or [],
+                "retrieval_metrics": {
+                    "node": "supervisor",
+                    "intent": primary,
+                    "tier": "compound",
+                    "elapsed_s": round(elapsed, 2),
+                },
             }
 
     # 2. Keyword-based single-intent (no LLM cost)
     kw_intent = _keyword_classify(query)
     if kw_intent:
+        elapsed = time.perf_counter() - t_start
         logger.info("Supervisor: keyword intent=%s query=%r", kw_intent, query[:80])
         return {
             **state,
@@ -186,6 +196,12 @@ def classify_intent(state: AgentState) -> AgentState:
             "intents": [kw_intent],
             "tier": "keyword",
             "combined_responses": state.get("combined_responses") or [],
+            "retrieval_metrics": {
+                "node": "supervisor",
+                "intent": kw_intent,
+                "tier": "keyword",
+                "elapsed_s": round(elapsed, 2),
+            },
         }
 
     # 3. Draft LLM fallback — stateless (no history passed).
@@ -200,6 +216,7 @@ def classify_intent(state: AgentState) -> AgentState:
 
     intents = _detect_intents_from_llm(query, raw)
     intent: Intent = intents[0]  # type: ignore[assignment]
+    elapsed = time.perf_counter() - t_start
 
     logger.info("Supervisor: llm intent=%s query=%r raw=%r", intent, query[:80], raw[:40])
     return {
@@ -208,4 +225,10 @@ def classify_intent(state: AgentState) -> AgentState:
         "intents": intents,
         "tier": "llm",
         "combined_responses": state.get("combined_responses") or [],
+        "retrieval_metrics": {
+            "node": "supervisor",
+            "intent": intent,
+            "tier": "llm",
+            "elapsed_s": round(elapsed, 2),
+        },
     }

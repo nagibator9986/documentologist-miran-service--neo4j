@@ -1,64 +1,109 @@
-"""Analyze Agent — Q&A on document, comparison, extraction, summary.
+"""Analyze Agent — Q&A, comparison, extraction, and summarisation.
 
-Pipeline:
-  1. _detect_task         — classify query into qa/compare/extract/summary
-  2. _enrich_search_query — referential enrichment ("этот документ" → filename)
-  3. _fetch_context       — Qdrant chunks + Neo4j sections + Neo4j entities
-  4. _run_analysis_llm    — LLM JSON generation (task-specific system prompt)
-  5. _format_summary      — assemble human-readable markdown summary
-  6. analyze_node         — orchestrator
+Pipeline (per request):
+  1. strip_conversational_prefix — remove greeting noise before retrieval
+  2. _detect_task                — classify into qa / compare / extract / summary
+  3. _enrich_search_query        — expand "этот документ" refs to real filenames
+  4. _retrieve_and_rerank        — vector → BM25 → graph sections → cross-encoder
+     └─ _retrieve_compare_pair  — for compare: fetches two independent contexts
+  5. _build_context_string       — assemble LLM-ready context with source headers
+  6. _run_analysis_llm           — task-specific prompt + LLM call
+     · compare / extract → JSON  (get_json_llm, num_predict=2000)
+     · qa / summary      → text  (get_llm,      num_predict=2000)
+  7. _parse_result               — JSON parse for structured tasks; pass-through text
+  8. _format_output              — readable markdown with human-friendly headers
+  9. _build_citations            — filename + page + rerank_score per hit
+ 10. analyze_node                — orchestrator; returns updated AgentState
 """
 from __future__ import annotations
 
 import logging
 import re
 import time
+from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from ..core.config import get_settings
-from ..core.llm import get_json_llm, invoke_with_retry
+from ..core.config import Settings, get_settings
+from ..core.llm import get_json_llm, get_llm, invoke_with_retry
 from ..core.utils import (
     DOC_REF_RE,
     build_final_response,
     build_history_messages,
+    extract_hit_filename,
+    extract_hit_page,
     extract_recent_filename,
     safe_parse_json,
+    strip_conversational_prefix,
 )
 from ..graph.state import AgentState
-from ..prompts import ANALYZE_COMPARE, ANALYZE_DOCUMENT
-from ..tools.neo4j_query import graph_entity_lookup, graph_section_search
+from ..prompts import (
+    ANALYZE_COMPARE,
+    ANALYZE_EXTRACT,
+    ANALYZE_QA,
+    ANALYZE_SUMMARY,
+)
+from ..tools.bm25_search import bm25_search
+from ..tools.neo4j_query import graph_section_search
 from ..tools.qdrant_search import qdrant_search
+from ..tools.reranker import reranker
 
 logger = logging.getLogger(__name__)
 
-# Task classification stems (Russian morphology)
-_COMPARE_STEMS = [r"сравн", r"отличи[ея]", r"разниц", r"различи[ея]"]
-_EXTRACT_STEMS = [r"извлек", r"вытащ", r"выдел[и]", r"найди все", r"укажи все", r"перечисл"]
-_SUMMARY_STEMS = [r"резюм", r"суммар", r"кратк", r"суммаризу"]
+# ── Task classification ────────────────────────────────────────────────────────
+
+TaskType = Literal["qa", "compare", "extract", "summary"]
+
+_COMPARE_STEMS = re.compile(
+    r"\b(?:сравн|сравнен|сопостав|отличи[ея]|разниц|различи[ея])\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_EXTRACT_STEMS = re.compile(
+    r"\b(?:извлек|вытащ|выдел[иа]|найди\s+все|укажи\s+все|перечисл)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_SUMMARY_STEMS = re.compile(
+    r"\b(?:резюм|суммар|суммаризу|кратк(?:о|ое|ий)|краткое\s+содержани)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Friendly display names for each task type used in _format_output headers.
+_TASK_LABELS: dict[TaskType, str] = {
+    "qa": "Ответ",
+    "compare": "Сравнительный анализ",
+    "extract": "Извлечённые данные",
+    "summary": "Резюме документа",
+}
+
+# Regex that extracts the two subjects of a compare query.
+# Handles patterns like "сравни X и Y", "сравни X с Y", "отличие X от Y".
+_COMPARE_PAIR_RE = re.compile(
+    r"(?:сравн\w*|сопостав\w*|отличи[ея]\s+\w+\s+от)\s+(.+?)\s+(?:и|с|vs\.?)\s+(.+?)$",
+    re.IGNORECASE | re.UNICODE,
+)
 
 
-# ── Stage 1: Task classification ─────────────────────────────────────────────
+# ── Stage 1 + 2: Task classification ──────────────────────────────────────────
 
-def _detect_task(query: str) -> str:
-    """Return one of: compare, extract, summary, qa (default)."""
+def _detect_task(query: str) -> TaskType:
+    """Return the analysis task type inferred from the user query."""
     q = query.lower()
-    if any(re.search(s, q) for s in _COMPARE_STEMS):
+    if _COMPARE_STEMS.search(q):
         return "compare"
-    if any(re.search(s, q) for s in _EXTRACT_STEMS):
+    if _EXTRACT_STEMS.search(q):
         return "extract"
-    if any(re.search(s, q) for s in _SUMMARY_STEMS):
+    if _SUMMARY_STEMS.search(q):
         return "summary"
     return "qa"
 
 
-# ── Stage 2: Referential query enrichment ────────────────────────────────────
+# ── Stage 3: Referential enrichment ──────────────────────────────────────────
 
 def _enrich_search_query(query: str, state: AgentState) -> tuple[str, str | None]:
-    """Expand "этот документ" references with the actual filename.
+    """Expand referential phrases like 'этот документ' with the actual filename.
 
     Returns:
-        (search_query, recent_filename) — search_query may be enriched.
+        (search_query, recent_filename)
     """
     if DOC_REF_RE.search(query):
         filename = extract_recent_filename(state)
@@ -68,143 +113,451 @@ def _enrich_search_query(query: str, state: AgentState) -> tuple[str, str | None
     return query, None
 
 
-# ── Stage 3: Context retrieval ────────────────────────────────────────────────
+# ── Stage 4a: Retrieve + rerank (single context) ──────────────────────────────
 
-def _fetch_context(
-    search_query: str, task: str
-) -> tuple[str, str, str, list[dict]]:
-    """Gather document context from Qdrant and Neo4j.
+def _retrieve_and_rerank(
+    search_query: str,
+    lexical_query: str,
+    limit: int,
+    s: Settings,
+) -> tuple[list[dict], float, bool]:
+    """Hybrid retrieval pipeline for analyze: vector → BM25 → graph → rerank.
+
+    Unlike the search agent this is deliberately synchronous (no thread pool)
+    because analyze tasks are already heavier LLM operations; the graph
+    enrichment adds minimal extra latency compared to the total task time.
 
     Returns:
-        (qdrant_chunks_str, graph_sections_str, entity_context_str, raw_hits)
+        (reranked_docs, best_rerank_score, has_usable_context)
     """
-    hits = qdrant_search.invoke({"query": search_query, "limit": 6})
-    qdrant_chunks = "\n\n".join(
-        f"[{i + 1}] {h.get('content', '')[:500]}" for i, h in enumerate(hits)
-    )
+    # 1. Vector search — broad semantic recall
+    vector_hits: list[dict] = qdrant_search.invoke({
+        "query": search_query,
+        "limit": limit,
+    })
 
-    graph_parts: list[str] = []
+    if not vector_hits:
+        return [], 0.0, False
+
+    # 2. BM25 over vector results — lifts lexically strong hits
+    bm25_hits: list[dict] = bm25_search.invoke({
+        "query": lexical_query,
+        "documents": vector_hits,
+        "top_k": limit,
+    })
+
+    # 3. Neo4j section enrichment — structured law/section text
+    graph_hits: list[dict] = []
     try:
-        sections = graph_section_search.invoke({"keywords": search_query[:80], "limit": 3})
+        kw = " ".join(
+            w for w in re.findall(r"[а-яёА-ЯЁa-zA-Z0-9]+", lexical_query)
+            if len(w) >= 3
+        )[:80]
+        sections = graph_section_search.invoke({"keywords": kw, "limit": 3})
         for sec in sections:
-            text = (sec.get("text") or "")[:400]
-            articles = sec.get("articles") or []
-            refs = ", ".join(
-                f"Статья {a.get('number')}" + (f" «{a.get('title')}»" if a.get("title") else "")
-                for a in articles if a.get("number")
-            )
-            entry = text + (f"\n[Статьи: {refs}]" if refs else "")
-            graph_parts.append(entry)
+            text = (sec.get("text") or "")[:s.content_snippet_max_len]
+            if text:
+                graph_hits.append({
+                    "id": sec.get("section_id") or f"sec:{hash(text)}",
+                    "content": text,
+                    "score": float(sec.get("score", 0.5)),
+                    "section": f"стр. {sec.get('page', '?')} — {sec.get('source', '')}",
+                    "metadata": {
+                        "source": sec.get("source", ""),
+                        "page": sec.get("page"),
+                    },
+                })
     except Exception as exc:
         logger.warning("analyze: graph section search failed: %s", exc)
 
-    graph_context = "\n".join(graph_parts) or "нет данных"
+    # 4. Merge BM25 + graph, dedup by ID
+    seen_ids: set[str] = set()
+    merged: list[dict] = []
+    for hit in bm25_hits + graph_hits:
+        hit_id = str(hit.get("id") or "")
+        if hit_id and hit_id in seen_ids:
+            continue
+        if hit_id:
+            seen_ids.add(hit_id)
+        merged.append(hit)
 
-    entity_parts: list[str] = []
-    if task in ("extract", "qa"):
-        try:
-            term = " ".join(search_query.split()[:5])
-            ents = graph_entity_lookup.invoke({"text": term[:60], "limit": 5})
-            for ent in ents:
-                line = f"{ent.get('text')} [{ent.get('label')}]"
-                if ent.get("role"):
-                    line += f" роль: {ent['role']}"
-                docs = ent.get("documents") or []
-                if docs:
-                    line += f" — из: {', '.join(docs[:2])}"
-                entity_parts.append(line)
-        except Exception as exc:
-            logger.warning("analyze: entity lookup failed: %s", exc)
+    # 5. Cross-encoder rerank over candidate pool
+    candidates = sorted(
+        merged, key=lambda d: float(d.get("score", 0)), reverse=True
+    )[:s.rerank_candidate_pool]
 
-    entity_context = "\n".join(f"- {e}" for e in entity_parts) or "нет данных"
-    return qdrant_chunks, graph_context, entity_context, hits
+    reranked: list[dict] = (
+        reranker.invoke({
+            "query": lexical_query,
+            "documents": candidates,
+            "top_k": s.rerank_top_k,
+        })
+        if candidates else []
+    )
+
+    best_score = reranked[0].get("rerank_score", 0.0) if reranked else 0.0
+    has_context = bool(reranked) and best_score >= s.search_min_confidence
+
+    logger.debug(
+        "analyze: retrieve_and_rerank hits=%d→bm25=%d→graph=%d→merged=%d "
+        "→reranked=%d  best_score=%.3f",
+        len(vector_hits), len(bm25_hits), len(graph_hits),
+        len(merged), len(reranked), best_score,
+    )
+    return reranked, best_score, has_context
 
 
-# ── Stage 4: LLM analysis ────────────────────────────────────────────────────
+# ── Stage 4b: Compare — fetch two independent contexts ────────────────────────
+
+def _extract_compare_subjects(query: str) -> tuple[str, str] | None:
+    """Try to extract the two subjects of a compare query.
+
+    Handles patterns like:
+    - "сравни закон о банках и закон о финансировании"
+    - "отличие залога от поручительства"
+    - "сравни главу 2 с главой 3"
+
+    Returns (subject_a, subject_b) or None if extraction fails.
+    """
+    m = _COMPARE_PAIR_RE.search(query)
+    if m:
+        a = m.group(1).strip()
+        b = m.group(2).strip()
+        # Sanity-check: each subject should be at least 2 characters
+        if len(a) >= 2 and len(b) >= 2:
+            return a, b
+    return None
+
+
+def _retrieve_compare_pair(
+    query: str,
+    s: Settings,
+) -> tuple[list[dict], list[dict], bool]:
+    """Fetch separate hit lists for the two sides of a comparison.
+
+    When subjects can be extracted, each side gets its own semantic search.
+    Falls back to a single unified search when extraction fails (returns the
+    unified list as side A with an empty side B).
+
+    Returns:
+        (hits_a, hits_b, used_pair_search)
+    """
+    subjects = _extract_compare_subjects(query)
+    if subjects:
+        subj_a, subj_b = subjects
+        logger.info("analyze compare: extracted pair (%r) vs (%r)", subj_a[:60], subj_b[:60])
+        hits_a = qdrant_search.invoke({"query": subj_a, "limit": s.analyze_compare_limit})
+        hits_b = qdrant_search.invoke({"query": subj_b, "limit": s.analyze_compare_limit})
+        return hits_a, hits_b, True
+
+    # Fallback: single search, split into two equal halves
+    hits = qdrant_search.invoke({"query": query, "limit": s.analyze_compare_limit * 2})
+    mid = len(hits) // 2 or len(hits)
+    return hits[:mid], hits[mid:], False
+
+
+# ── Stage 5: Context string assembly ──────────────────────────────────────────
+
+def _build_context_string(
+    hits: list[dict],
+    label: str = "Контекст",
+    s: Settings | None = None,
+) -> str:
+    """Build a numbered context string with source headers for the LLM.
+
+    Each block starts with:
+        [Источник N] Документ: <filename>, стр. <page>
+        <content>
+
+    This mirrors the search agent format so ANALYZE_QA can use the same
+    source-citation convention.
+    """
+    if s is None:
+        s = get_settings()
+    parts: list[str] = []
+    for i, d in enumerate(hits):
+        filename = extract_hit_filename(d) or "—"
+        page = extract_hit_page(d)
+        page_suffix = f", стр. {page}" if page else ""
+        content = d.get("content", "")[:s.content_snippet_max_len]
+        parts.append(
+            f"[Источник {i + 1}] Документ: {filename}{page_suffix}\n{content}"
+        )
+    return f"{label}:\n" + "\n\n".join(parts) if parts else f"{label}: нет данных"
+
+
+def _build_compare_context(
+    hits_a: list[dict],
+    hits_b: list[dict],
+    subjects: tuple[str, str] | None,
+    s: Settings,
+) -> str:
+    """Build a two-sided context block for compare tasks."""
+    label_a = f"Документ А ({subjects[0]})" if subjects else "Документ А"
+    label_b = f"Документ Б ({subjects[1]})" if subjects else "Документ Б"
+    ctx_a = _build_context_string(hits_a, label=label_a, s=s)
+    ctx_b = _build_context_string(hits_b, label=label_b, s=s)
+    return f"{ctx_a}\n\n{'─' * 60}\n\n{ctx_b}"
+
+
+# ── Stage 6: LLM call ──────────────────────────────────────────────────────────
+
+_NO_CONTEXT_RESPONSE = (
+    "В загруженных документах не найдено достаточно релевантной информации "
+    "по данному запросу. Попробуйте переформулировать запрос или загрузить "
+    "нужный документ."
+)
+
+_TASK_SYSTEM_PROMPTS: dict[TaskType, str] = {
+    "qa": ANALYZE_QA,
+    "compare": ANALYZE_COMPARE,
+    "extract": ANALYZE_EXTRACT,
+    "summary": ANALYZE_SUMMARY,
+}
+
+# Tasks that return structured JSON (others return free text)
+_JSON_TASKS: frozenset[TaskType] = frozenset({"compare", "extract"})
+
 
 def _run_analysis_llm(
     query: str,
-    task: str,
+    task: TaskType,
+    context_str: str,
     recent_filename: str | None,
-    qdrant_chunks: str,
-    graph_context: str,
-    entity_context: str,
     state: AgentState,
-) -> dict:
-    """Call LLM with task-specific system prompt and return parsed JSON result."""
-    s = get_settings()
-    system_prompt = ANALYZE_COMPARE if task == "compare" else ANALYZE_DOCUMENT
+    s: Settings,
+) -> str:
+    """Call the LLM with the appropriate task prompt and return raw output.
+
+    · compare / extract → JSON format (get_json_llm, higher num_predict)
+    · qa / summary      → free text  (get_llm, avoids JSON overhead + truncation)
+    """
+    system_prompt = _TASK_SYSTEM_PROMPTS[task]
     doc_hint = f"\nАнализируемый документ: {recent_filename}\n" if recent_filename else ""
-    prompt = (
+    user_msg = (
         f"Запрос: {query}\n{doc_hint}\n"
-        f"Фрагменты документов (Qdrant):\n{qdrant_chunks}\n\n"
-        f"Релевантные секции из графа знаний (Neo4j):\n{graph_context}\n\n"
-        f"Сущности из графа (организации, стороны, роли):\n{entity_context}"
+        f"{context_str}"
     )
-    llm = get_json_llm(num_predict=1500)
+
     history = build_history_messages(state, max_turns=s.history_turns)
-    raw = invoke_with_retry(llm, [
+
+    if task in _JSON_TASKS:
+        llm = get_json_llm(num_predict=2000)
+    else:
+        llm = get_llm(num_predict=2000)
+
+    return invoke_with_retry(llm, [
         SystemMessage(content=system_prompt),
         *history,
-        HumanMessage(content=prompt),
+        HumanMessage(content=user_msg),
     ])
-    return safe_parse_json(
-        raw, {"task": task, "result": raw, "entities": [], "key_points": [], "confidence": 0.5}
-    )
 
 
-# ── Stage 5: Human-readable summary ──────────────────────────────────────────
+# ── Stage 7: Result parsing ────────────────────────────────────────────────────
 
-def _format_summary(result: dict, task: str) -> str:
-    parts = [f"**Анализ ({task.upper()}):**\n\n{result.get('result', '')}"]
+def _parse_result(raw: str, task: TaskType, query: str) -> dict:
+    """Parse LLM output into a normalised dict.
+
+    JSON tasks (compare, extract): use safe_parse_json with a task-specific fallback.
+    Text tasks (qa, summary): wrap raw text in {"task": task, "result": raw}.
+    """
+    if task in _JSON_TASKS:
+        fallback = {
+            "task": task,
+            "result": raw,
+            "similarities": [],
+            "differences": [],
+            "entities": [],
+            "key_points": [],
+            "recommendations": [],
+            "legal_conflicts": [],
+            "confidence": 0.5,
+        }
+        return safe_parse_json(raw, fallback)
+
+    # Free-text tasks: no JSON expected
+    return {
+        "task": task,
+        "result": raw.strip(),
+        "confidence": 0.9 if raw.strip() else 0.0,
+    }
+
+
+# ── Stage 8: Output formatting ────────────────────────────────────────────────
+
+def _format_output(result: dict, task: TaskType) -> str:
+    """Render the parsed result as human-readable markdown.
+
+    Uses friendly section headers, not technical task names.
+    """
+    label = _TASK_LABELS.get(task, "Анализ")
+    parts = [f"**{label}:**\n\n{result.get('result', '')}"]
+
     if result.get("key_points"):
-        parts.append("**Ключевые тезисы:**\n" + "\n".join(f"- {p}" for p in result["key_points"]))
+        parts.append(
+            "**Ключевые тезисы:**\n"
+            + "\n".join(f"- {p}" for p in result["key_points"])
+        )
     if result.get("similarities"):
-        parts.append("**Сходства:**\n" + "\n".join(f"- {s}" for s in result["similarities"]))
+        parts.append(
+            "**Сходства:**\n"
+            + "\n".join(f"- {s}" for s in result["similarities"])
+        )
     if result.get("differences"):
-        parts.append("**Различия:**\n" + "\n".join(f"- {d}" for d in result["differences"]))
+        parts.append(
+            "**Различия:**\n"
+            + "\n".join(f"- {d}" for d in result["differences"])
+        )
     if result.get("legal_conflicts"):
-        parts.append("**Противоречия:**\n" + "\n".join(f"- {c}" for c in result["legal_conflicts"]))
+        parts.append(
+            "**Правовые противоречия:**\n"
+            + "\n".join(f"- {c}" for c in result["legal_conflicts"])
+        )
     if result.get("entities"):
         entity_str = ", ".join(
             f"{e.get('value', e.get('name', ''))} [{e.get('type', '')}]"
+            + (f" — {e['source']}" if e.get("source") else "")
             for e in result["entities"]
             if e.get("value") or e.get("name")
         )
         if entity_str:
             parts.append(f"**Сущности:** {entity_str}")
     if result.get("recommendations"):
-        parts.append("**Рекомендации:**\n" + "\n".join(f"- {r}" for r in result["recommendations"]))
-    parts.append(f"*Уверенность: {result.get('confidence', 0.5):.0%}*")
+        parts.append(
+            "**Рекомендации:**\n"
+            + "\n".join(f"- {r}" for r in result["recommendations"])
+        )
+
+    confidence = result.get("confidence", 0.5)
+    parts.append(f"*Уверенность: {confidence:.0%}*")
     return "\n\n".join(parts)
+
+
+# ── Stage 9: Citations ────────────────────────────────────────────────────────
+
+def _build_citations(hits: list[dict], s: Settings) -> list[dict]:
+    """Build structured citation records from reranked hits."""
+    return [
+        {
+            "index": i + 1,
+            "content_preview": d.get("content", "")[:s.citation_preview_max_len],
+            "filename": extract_hit_filename(d),
+            "page_number": extract_hit_page(d),
+            "section": d.get("section", ""),
+            "score": d.get("rerank_score", d.get("score", 0.0)),
+        }
+        for i, d in enumerate(hits[:s.rerank_top_k])
+    ]
 
 
 # ── Graph entry point ─────────────────────────────────────────────────────────
 
 def analyze_node(state: AgentState) -> AgentState:
-    """Analysis node: detect task → enrich query → retrieve → LLM → format."""
+    """Analysis node: classify task → retrieve → rerank → LLM → format."""
     t_start = time.perf_counter()
-    query = state["user_query"]
+    s = get_settings()
+    raw_query = state["user_query"]
 
+    # 1. Strip greeting noise (same as search agent)
+    query = strip_conversational_prefix(raw_query)
+
+    # 2. Detect task
     task = _detect_task(query)
+
+    # 3. Referential enrichment
     search_query, recent_filename = _enrich_search_query(query, state)
-    qdrant_chunks, graph_context, entity_context, hits = _fetch_context(search_query, task)
-    analyze_result = _run_analysis_llm(
-        query, task, recent_filename, qdrant_chunks, graph_context, entity_context, state
-    )
-    summary = _format_summary(analyze_result, task)
+
+    # ── 4. Retrieve depending on task ────────────────────────────────────────
+    all_hits: list[dict] = []
+    has_context = False
+    best_score = 0.0
+    context_str = ""
+
+    if task == "compare":
+        # Fetch two independent hit-lists for the two sides
+        subjects = _extract_compare_subjects(query)
+        hits_a, hits_b, used_pair = _retrieve_compare_pair(query, s)
+
+        # Rerank each side independently so the cross-encoder sees the right query
+        query_a = subjects[0] if subjects else query
+        query_b = subjects[1] if subjects else query
+        reranked_a, score_a, ok_a = _retrieve_and_rerank(query_a, query_a, s.analyze_compare_limit, s)
+        reranked_b, score_b, ok_b = _retrieve_and_rerank(query_b, query_b, s.analyze_compare_limit, s)
+
+        has_context = ok_a or ok_b
+        best_score = max(score_a, score_b)
+        all_hits = reranked_a + reranked_b
+
+        context_str = _build_compare_context(reranked_a, reranked_b, subjects, s)
+
+    elif task == "summary":
+        # Summary needs broad coverage — use a larger hit limit
+        reranked, best_score, has_context = _retrieve_and_rerank(
+            search_query, query, s.analyze_summary_limit, s
+        )
+        all_hits = reranked
+        context_str = _build_context_string(reranked, s=s)
+
+    else:
+        # qa / extract — standard retrieve
+        reranked, best_score, has_context = _retrieve_and_rerank(
+            search_query, query, s.rerank_top_k * 2, s
+        )
+        all_hits = reranked
+        context_str = _build_context_string(reranked, s=s)
+
+    # ── 5. No-context fallback — honest "not found" instead of hallucination ─
+    if not has_context:
+        logger.warning(
+            "analyze_node: no usable context (best_score=%.3f, task=%s, query=%r)",
+            best_score, task, query[:80],
+        )
+        elapsed = time.perf_counter() - t_start
+        final_response = build_final_response(
+            _NO_CONTEXT_RESPONSE, state.get("combined_responses") or []
+        )
+        return {
+            **state,
+            "analyze_result": {"task": task, "result": _NO_CONTEXT_RESPONSE, "confidence": 0.0},
+            "citations": [],
+            "final_response": final_response,
+            "retrieval_metrics": {
+                "node": "analyze",
+                "intent": state.get("intent", ""),
+                "tier": state.get("tier", ""),
+                "task": task,
+                "hits": 0,
+                "best_score": 0.0,
+                "has_context": False,
+                "json_parse_success": None,
+                "elapsed_s": round(elapsed, 2),
+            },
+            "messages": state["messages"] + [AIMessage(content=final_response)],
+        }
+
+    # ── 6. LLM call ──────────────────────────────────────────────────────────
+    raw = _run_analysis_llm(query, task, context_str, recent_filename, state, s)
+
+    # ── 7–8. Parse + format ───────────────────────────────────────────────────
+    analyze_result = _parse_result(raw, task, query)
+    summary = _format_output(analyze_result, task)
+
+    # ── 9. Citations ──────────────────────────────────────────────────────────
+    citations = _build_citations(all_hits, s)
+
     final_response = build_final_response(summary, state.get("combined_responses") or [])
-
-    citations = [
-        {"index": i + 1, "content": h.get("content", "")[:200], "score": h.get("score", 0.0)}
-        for i, h in enumerate(hits[:3])
-    ]
-
     elapsed = time.perf_counter() - t_start
+
     logger.info(
-        "analyze_node: task=%s hits=%d confidence=%.2f elapsed=%.2fs",
-        task, len(hits), analyze_result.get("confidence", 0), elapsed,
+        "analyze_node: task=%s hits=%d best_score=%.3f confidence=%.2f elapsed=%.2fs",
+        task, len(all_hits), best_score,
+        analyze_result.get("confidence", 0.0), elapsed,
     )
+
+    # json_parse_success: only meaningful for JSON tasks (compare, extract)
+    _json_parse_success: bool | None = None
+    if task in _JSON_TASKS:
+        _json_parse_success = not analyze_result.get("_parse_failed", False)
 
     return {
         **state,
@@ -213,9 +566,13 @@ def analyze_node(state: AgentState) -> AgentState:
         "final_response": final_response,
         "retrieval_metrics": {
             "node": "analyze",
+            "intent": state.get("intent", ""),
+            "tier": state.get("tier", ""),
             "task": task,
-            "qdrant_hits": len(hits),
-            "confidence": analyze_result.get("confidence", 0),
+            "hits": len(all_hits),
+            "best_score": round(best_score, 4),
+            "has_context": has_context,
+            "json_parse_success": _json_parse_success,
             "elapsed_s": round(elapsed, 2),
         },
         "messages": state["messages"] + [AIMessage(content=final_response)],
