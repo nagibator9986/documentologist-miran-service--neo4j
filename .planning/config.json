@@ -1,0 +1,12 @@
+{
+  "workflow": {
+    "research_enabled": false,
+    "auto_commit": true,
+    "require_plan_approval": true,
+    "parallel_execution": true,
+    "_auto_chain_active": false
+  },
+  "project_type": "brownfield",
+  "language": "ru",
+  "model_profile": "quality"
+}
