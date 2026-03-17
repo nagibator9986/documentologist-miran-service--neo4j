@@ -8,9 +8,9 @@ Pipeline (per request):
      └─ _retrieve_compare_pair  — for compare: fetches two independent contexts
   5. _build_context_string       — assemble LLM-ready context with source headers
   6. _run_analysis_llm           — task-specific prompt + LLM call
-     · compare / extract → JSON  (get_json_llm, num_predict=2000)
-     · qa / summary      → text  (get_llm,      num_predict=2000)
-  7. _parse_result               — JSON parse for structured tasks; pass-through text
+     · compare / extract → JSON  (parse_with_retry + Pydantic schema, num_predict=2000)
+     · qa / summary      → text  (get_llm, num_predict=2000)
+  7. _parse_result               — validated dict for JSON tasks; pass-through text
   8. _format_output              — readable markdown with human-friendly headers
   9. _build_citations            — filename + page + rerank_score per hit
  10. analyze_node                — orchestrator; returns updated AgentState
@@ -25,7 +25,8 @@ from typing import Literal
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ..core.config import Settings, get_settings
-from ..core.llm import get_json_llm, get_llm, invoke_with_retry
+from ..core.json_output import AnalyzeCompareResult, AnalyzeExtractResult, parse_with_retry
+from ..core.llm import get_llm, invoke_with_retry
 from ..core.utils import (
     DOC_REF_RE,
     build_final_response,
@@ -33,7 +34,6 @@ from ..core.utils import (
     extract_hit_filename,
     extract_hit_page,
     extract_recent_filename,
-    safe_parse_json,
     strip_conversational_prefix,
 )
 from ..graph.state import AgentState
@@ -318,6 +318,11 @@ _TASK_SYSTEM_PROMPTS: dict[TaskType, str] = {
 # Tasks that return structured JSON (others return free text)
 _JSON_TASKS: frozenset[TaskType] = frozenset({"compare", "extract"})
 
+_JSON_TASK_SCHEMAS: dict[str, type] = {
+    "compare": AnalyzeCompareResult,
+    "extract": AnalyzeExtractResult,
+}
+
 
 def _run_analysis_llm(
     query: str,
@@ -326,11 +331,16 @@ def _run_analysis_llm(
     recent_filename: str | None,
     state: AgentState,
     s: Settings,
-) -> str:
-    """Call the LLM with the appropriate task prompt and return raw output.
+) -> tuple[str | dict, bool]:
+    """Call the LLM with the appropriate task prompt.
 
-    · compare / extract → JSON format (get_json_llm, higher num_predict)
-    · qa / summary      → free text  (get_llm, avoids JSON overhead + truncation)
+    For JSON tasks (compare, extract): uses parse_with_retry with schema constraint.
+    For text tasks (qa, summary): uses get_llm, returns raw text.
+
+    Returns:
+        (raw_output_or_dict, json_success)
+        - JSON tasks: (dict from model_dump or raw str, success bool)
+        - Text tasks: (raw str, True) — no JSON parsing needed
     """
     system_prompt = _TASK_SYSTEM_PROMPTS[task]
     doc_hint = f"\nАнализируемый документ: {recent_filename}\n" if recent_filename else ""
@@ -342,29 +352,45 @@ def _run_analysis_llm(
     history = build_history_messages(state, max_turns=s.history_turns)
 
     if task in _JSON_TASKS:
-        llm = get_json_llm(num_predict=2000)
+        schema = _JSON_TASK_SCHEMAS[task]
+        messages = [
+            SystemMessage(content=system_prompt),
+            *history,
+            HumanMessage(content=user_msg),
+        ]
+        result, success = parse_with_retry(messages, schema, num_predict=2000)
+        if success and result is not None:
+            return result.model_dump(), True
+        # Return raw empty string on total failure — _parse_result will create fallback
+        return "", False
     else:
         llm = get_llm(num_predict=2000)
-
-    return invoke_with_retry(llm, [
-        SystemMessage(content=system_prompt),
-        *history,
-        HumanMessage(content=user_msg),
-    ])
+        raw = invoke_with_retry(llm, [
+            SystemMessage(content=system_prompt),
+            *history,
+            HumanMessage(content=user_msg),
+        ])
+        return raw, True
 
 
 # ── Stage 7: Result parsing ────────────────────────────────────────────────────
 
-def _parse_result(raw: str, task: TaskType, query: str) -> dict:
+def _parse_result(raw: str | dict, task: TaskType, query: str, json_success: bool = True) -> dict:
     """Parse LLM output into a normalised dict.
 
-    JSON tasks (compare, extract): use safe_parse_json with a task-specific fallback.
-    Text tasks (qa, summary): wrap raw text in {"task": task, "result": raw}.
+    JSON tasks: if json_success=True, raw is already a validated dict.
+    If json_success=False, build fallback dict with _parse_failed=True.
+    Text tasks: wrap raw text in {"task": task, "result": raw}.
     """
     if task in _JSON_TASKS:
-        fallback = {
+        if json_success and isinstance(raw, dict):
+            return raw
+
+        # Parse failure fallback
+        raw_str = raw if isinstance(raw, str) else ""
+        return {
             "task": task,
-            "result": raw,
+            "result": raw_str,
             "similarities": [],
             "differences": [],
             "entities": [],
@@ -372,14 +398,15 @@ def _parse_result(raw: str, task: TaskType, query: str) -> dict:
             "recommendations": [],
             "legal_conflicts": [],
             "confidence": 0.5,
+            "_parse_failed": True,
         }
-        return safe_parse_json(raw, fallback)
 
     # Free-text tasks: no JSON expected
+    raw_str = raw if isinstance(raw, str) else str(raw)
     return {
         "task": task,
-        "result": raw.strip(),
-        "confidence": 0.9 if raw.strip() else 0.0,
+        "result": raw_str.strip(),
+        "confidence": 0.9 if raw_str.strip() else 0.0,
     }
 
 
@@ -536,10 +563,10 @@ def analyze_node(state: AgentState) -> AgentState:
         }
 
     # ── 6. LLM call ──────────────────────────────────────────────────────────
-    raw = _run_analysis_llm(query, task, context_str, recent_filename, state, s)
+    raw, json_success = _run_analysis_llm(query, task, context_str, recent_filename, state, s)
 
     # ── 7–8. Parse + format ───────────────────────────────────────────────────
-    analyze_result = _parse_result(raw, task, query)
+    analyze_result = _parse_result(raw, task, query, json_success=json_success)
     summary = _format_output(analyze_result, task)
 
     # ── 9. Citations ──────────────────────────────────────────────────────────
