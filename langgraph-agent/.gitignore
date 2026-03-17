@@ -25,3 +25,6 @@ app/tools/fonts/*.ttf
 
 # Logs
 *.log
+
+# Eval results (generated)
+tests/eval/results.json
