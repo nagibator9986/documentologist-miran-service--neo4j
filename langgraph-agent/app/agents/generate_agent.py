@@ -27,8 +27,9 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ..core.config import get_settings
-from ..core.llm import get_draft_llm, get_json_llm, invoke_with_retry
-from ..core.utils import build_final_response, safe_parse_json, strip_conversational_prefix
+from ..core.json_output import GeneratePlan, parse_with_retry
+from ..core.llm import get_draft_llm, invoke_with_retry
+from ..core.utils import build_final_response, strip_conversational_prefix
 from ..graph.state import AgentState
 from ..prompts import GENERATE_PLAN, GENERATE_VALIDATE
 from ..tools.doc_generate import doc_generate, docx_export, pdf_export
@@ -142,19 +143,26 @@ def _retrieve_legal_context(query: str) -> tuple[list[dict], str]:
 # ── Stage 2: Document structure planning ─────────────────────────────────────
 
 def _plan_document(query: str, legal_context: str) -> dict:
-    """Ask the LLM to produce a JSON document plan."""
-    llm_json = get_json_llm(num_predict=1024)
-    raw = invoke_with_retry(llm_json, [
+    """Ask the LLM to produce a JSON document plan with schema validation and retry."""
+    messages = [
         SystemMessage(content=GENERATE_PLAN),
         HumanMessage(content=f"Запрос: {query}\n\nПрименимые нормы:\n{legal_context[:3000]}"),
-    ])
-    return safe_parse_json(raw, {
+    ]
+
+    result, success = parse_with_retry(messages, GeneratePlan, num_predict=2048)
+
+    if success and result is not None:
+        return result.model_dump()
+
+    # Fallback: preserve existing behavior
+    return {
         "template_type": "report",
         "title": "Документ",
         "context": {"subject": query},
         "export_format": "docx",
         "required_sections": [],
-    })
+        "_parse_failed": True,
+    }
 
 
 # ── Stage 3: Draft generation ────────────────────────────────────────────────
