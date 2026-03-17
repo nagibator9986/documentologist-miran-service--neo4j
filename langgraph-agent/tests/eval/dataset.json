@@ -1,0 +1,281 @@
+[
+  {
+    "id": "route-01",
+    "query": "что такое овердрафт",
+    "expected_intent": "search",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["search", "keyword", "informational"]
+  },
+  {
+    "id": "route-02",
+    "query": "какие требования к капиталу банка",
+    "expected_intent": "search",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["search", "keyword", "informational"]
+  },
+  {
+    "id": "route-03",
+    "query": "расскажи про лицензирование банков",
+    "expected_intent": "search",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["search", "keyword", "informational"]
+  },
+  {
+    "id": "route-04",
+    "query": "объясни порядок ликвидации банка",
+    "expected_intent": "search",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["search", "keyword", "procedural"]
+  },
+  {
+    "id": "route-05",
+    "query": "как получить банковскую лицензию в Казахстане",
+    "expected_intent": "search",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["search", "keyword", "procedural"]
+  },
+  {
+    "id": "route-06",
+    "query": "проверь: банк может выдавать кредиты без лицензии",
+    "expected_intent": "verify",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["verify", "keyword", "compliance"]
+  },
+  {
+    "id": "route-07",
+    "query": "соответствует ли: минимальный капитал 500 млн тенге",
+    "expected_intent": "verify",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["verify", "keyword", "compliance"]
+  },
+  {
+    "id": "route-08",
+    "query": "верно ли что банк обязан иметь резервный фонд",
+    "expected_intent": "verify",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["verify", "keyword", "obligation"]
+  },
+  {
+    "id": "route-09",
+    "query": "составь справку о требованиях к банковской лицензии",
+    "expected_intent": "generate",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["generate", "keyword", "document"]
+  },
+  {
+    "id": "route-10",
+    "query": "сгенерируй отчёт о порядке открытия банка",
+    "expected_intent": "generate",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["generate", "keyword", "report"]
+  },
+  {
+    "id": "route-11",
+    "query": "сравни требования к банкам первого и второго уровня",
+    "expected_intent": "analyze",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["analyze", "keyword", "compare"]
+  },
+  {
+    "id": "route-12",
+    "query": "проанализируй статью 20 закона о банках",
+    "expected_intent": "analyze",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["analyze", "keyword", "extract"]
+  },
+  {
+    "id": "route-13",
+    "query": "загрузи документ",
+    "expected_intent": "ingest",
+    "expected_docs": [],
+    "expected_json_valid": null,
+    "category": "routing",
+    "tags": ["ingest", "keyword"]
+  },
+  {
+    "id": "json-01",
+    "query": "проверь договор на соответствие закону о банках РК",
+    "expected_intent": "verify",
+    "expected_docs": [],
+    "expected_json_valid": true,
+    "category": "json_validity",
+    "tags": ["verify", "json", "compliance"]
+  },
+  {
+    "id": "json-02",
+    "query": "есть ли нарушения в условиях кредитного договора",
+    "expected_intent": "verify",
+    "expected_docs": [],
+    "expected_json_valid": true,
+    "category": "json_validity",
+    "tags": ["verify", "json", "violations"]
+  },
+  {
+    "id": "json-03",
+    "query": "проверь на соответствие нормам: процентная ставка 25% годовых",
+    "expected_intent": "verify",
+    "expected_docs": [],
+    "expected_json_valid": true,
+    "category": "json_validity",
+    "tags": ["verify", "json", "rate-check"]
+  },
+  {
+    "id": "json-04",
+    "query": "оцени риски по залоговому договору",
+    "expected_intent": "verify",
+    "expected_docs": [],
+    "expected_json_valid": true,
+    "category": "json_validity",
+    "tags": ["verify", "json", "risk"]
+  },
+  {
+    "id": "json-05",
+    "query": "составь договор банковского обслуживания",
+    "expected_intent": "generate",
+    "expected_docs": [],
+    "expected_json_valid": true,
+    "category": "json_validity",
+    "tags": ["generate", "json", "contract"]
+  },
+  {
+    "id": "json-06",
+    "query": "создай шаблон кредитного соглашения",
+    "expected_intent": "generate",
+    "expected_docs": [],
+    "expected_json_valid": true,
+    "category": "json_validity",
+    "tags": ["generate", "json", "template"]
+  },
+  {
+    "id": "json-07",
+    "query": "сгенерируй справку о капитализации банка",
+    "expected_intent": "generate",
+    "expected_docs": [],
+    "expected_json_valid": true,
+    "category": "json_validity",
+    "tags": ["generate", "json", "report"]
+  },
+  {
+    "id": "json-08",
+    "query": "сравни условия депозитов в Kaspi и Halyk банках",
+    "expected_intent": "analyze",
+    "expected_docs": [],
+    "expected_json_valid": true,
+    "category": "json_validity",
+    "tags": ["analyze", "json", "compare"]
+  },
+  {
+    "id": "json-09",
+    "query": "извлеки все обязательства из договора залога",
+    "expected_intent": "analyze",
+    "expected_docs": [],
+    "expected_json_valid": true,
+    "category": "json_validity",
+    "tags": ["analyze", "json", "extract"]
+  },
+  {
+    "id": "json-10",
+    "query": "перечисли все виды банковских операций из закона",
+    "expected_intent": "analyze",
+    "expected_docs": [],
+    "expected_json_valid": true,
+    "category": "json_validity",
+    "tags": ["analyze", "json", "enumerate"]
+  },
+  {
+    "id": "retrieval-01",
+    "query": "каков минимальный размер уставного капитала банка второго уровня",
+    "expected_intent": "search",
+    "expected_docs": ["zakon_o_bankah.pdf", "trebovaniya_k_kapitalu.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "capital"]
+  },
+  {
+    "id": "retrieval-02",
+    "query": "порядок выдачи банковской лицензии Национальным Банком РК",
+    "expected_intent": "search",
+    "expected_docs": ["zakon_o_bankah.pdf", "licenzirovanie.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "licensing"]
+  },
+  {
+    "id": "retrieval-03",
+    "query": "требования к учредителям банка в Казахстане",
+    "expected_intent": "search",
+    "expected_docs": ["zakon_o_bankah.pdf", "trebovaniya_uchrediteli.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "founders"]
+  },
+  {
+    "id": "retrieval-04",
+    "query": "какие ограничения установлены для банковских холдингов",
+    "expected_intent": "search",
+    "expected_docs": ["zakon_o_bankah.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "holdings"]
+  },
+  {
+    "id": "retrieval-05",
+    "query": "обязанности банка по противодействию легализации доходов",
+    "expected_intent": "search",
+    "expected_docs": ["aml_zakon.pdf", "zakon_o_bankah.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "aml"]
+  },
+  {
+    "id": "retrieval-06",
+    "query": "процедура принудительной ликвидации банка",
+    "expected_intent": "search",
+    "expected_docs": ["zakon_o_bankah.pdf", "likvidaciya.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "liquidation"]
+  },
+  {
+    "id": "retrieval-07",
+    "query": "какие документы нужны для открытия депозита юридическому лицу",
+    "expected_intent": "search",
+    "expected_docs": ["depozity.pdf", "bankovskie_operacii.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "deposits"]
+  },
+  {
+    "id": "retrieval-08",
+    "query": "нормативы достаточности собственного капитала банка",
+    "expected_intent": "search",
+    "expected_docs": ["prudencialnye_normativy.pdf", "zakon_o_bankah.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "prudential"]
+  }
+]
