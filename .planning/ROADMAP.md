@@ -28,11 +28,11 @@ Plans:
 
 ## Phase 2: JSON Reliability Fix
 **Goal:** JSON parse success ≥ 95% во всех агентах с структурированным выводом.
-**Plans:** 4 plans
+**Plans:** 2/4 plans executed
 
 Plans:
-- [ ] 02-01-PLAN.md — Core JSON output layer (Pydantic schemas + parse_with_retry + get_schema_llm)
-- [ ] 02-02-PLAN.md — Anti-markdown instructions in all 4 JSON prompts
+- [x] 02-01-PLAN.md — Core JSON output layer (Pydantic schemas + parse_with_retry + get_schema_llm)
+- [x] 02-02-PLAN.md — Anti-markdown instructions in all 4 JSON prompts
 - [ ] 02-03-PLAN.md — Wire verify_agent + generate_agent to parse_with_retry
 - [ ] 02-04-PLAN.md — Wire analyze_agent compare/extract to parse_with_retry
 
