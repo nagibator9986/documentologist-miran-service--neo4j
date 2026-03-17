@@ -8,7 +8,7 @@
 
 ## Phase 1: Observability & Eval Infrastructure
 **Goal:** Создать измерительную инфраструктуру — невозможно чинить то, что нельзя измерить.
-**Plans:** 3 plans
+**Plans:** 1/3 plans executed
 
 Plans:
 - [x] 01-01-PLAN.md — MLflow config, structured logging, tier in AgentState
