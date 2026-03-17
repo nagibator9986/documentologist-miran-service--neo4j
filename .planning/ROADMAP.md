@@ -11,7 +11,7 @@
 **Plans:** 3 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — MLflow config, structured logging, tier in AgentState
+- [x] 01-01-PLAN.md — MLflow config, structured logging, tier in AgentState
 - [ ] 01-02-PLAN.md — Eval dataset (30+ queries), debug retrieval endpoint
 - [ ] 01-03-PLAN.md — Agent metrics enrichment, eval runner script
 
