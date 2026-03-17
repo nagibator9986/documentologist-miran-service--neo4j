@@ -36,6 +36,8 @@ class AgentState(TypedDict):
     # All detected intents — enables multi-intent execution.
     # e.g. ["search", "verify"] runs search first, then verify in sequence.
     intents: list[str]
+    # Routing tier: "compound", "keyword", or "llm" — set by supervisor
+    tier: str
     # document IDs the user mentioned / uploaded
     document_ids: list[str]
 
