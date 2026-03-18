@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 05-02-PLAN.md
-last_updated: "2026-03-18T10:59:32Z"
+stopped_at: Completed 05-01-PLAN.md
+last_updated: "2026-03-18T11:03:09Z"
 progress:
   total_phases: 5
   completed_phases: 4
   total_plans: 17
-  completed_plans: 16
+  completed_plans: 17
 ---
 
 # Project State
@@ -20,7 +20,7 @@ progress:
 **Date:** 2026-03-18
 
 ## Active Work
-Phase 5 in progress. Plan 01 (pending), Plan 02 (env/docker/makefile hardening - complete), Plan 03 (pending).
+Phase 5 in progress. Plan 01 (integration tests + Ollama health - complete), Plan 02 (env/docker/makefile hardening - complete), Plan 03 (pending).
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
@@ -41,6 +41,7 @@ Phase 5 in progress. Plan 01 (pending), Plan 02 (env/docker/makefile hardening -
 - [x] Phase 4 Plan 03 — Hallucination guard + graceful degradation: search/analyze empty guards, HTTP 500->200 (commits: d878e11, 22c4c87)
 
 ## Completed
+- [x] Phase 5 Plan 01 — Integration tests + Ollama health check: 11 tests covering all 5 agents, conftest with TestClient + mock graph, /health/detailed Ollama check (commits: afa136c, 495356c, 60b5ad6)
 - [x] Phase 5 Plan 02 — Env/Docker/Makefile hardening: 68 Settings fields in .env.example, Makefile eval/prod targets, docker-compose.prod.yml overlay (commits: adb7b2a, 4498aa8)
 
 ## Key Decisions
@@ -76,6 +77,9 @@ Phase 5 in progress. Plan 01 (pending), Plan 02 (env/docker/makefile hardening -
 - **--compatibility flag required** — deploy.resources.limits silently ignored without Swarm
 - **langgraph-agent gets 4CPU/4G** — largest allocation due to cross-encoder workload
 - **MLFLOW_ENABLED=false in prod overlay** — reduces overhead; enable explicitly when needed
+- **Sync TestClient over async httpx.AsyncClient** — avoids event loop conflicts with pytest-asyncio
+- **Client fixture yields (client, mock_graph) tuple** — per-test graph.invoke override for intent-specific mocking
+- **Patch app.core.utils not app.main for health mocks** — health_detailed uses local import from .core.utils
 
 ## Critical Context
 - Код находится в: `documentologist-miran-service--neo4j/langgraph-agent/`
@@ -88,7 +92,7 @@ Phase 5 in progress. Plan 01 (pending), Plan 02 (env/docker/makefile hardening -
 - Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Completed 05-02-PLAN.md
+Stopped at: Completed 05-01-PLAN.md
 
 ## Next Action
-Phase 5 Plan 02 complete. Remaining: Plan 01 and Plan 03. Production Docker config ready for deployment.
+Phase 5 Plans 01 and 02 complete. Remaining: Plan 03. Integration tests and production config ready.

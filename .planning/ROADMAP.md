@@ -95,7 +95,7 @@ Plans:
 
 ## Phase 5: Production Hardening
 **Goal:** Система готова к деплою: тесты, CI, Docker prod конфиг.
-**Plans:** 1/3 plans executed
+**Plans:** 2/3 plans executed
 **Requirements:** [FR-6, FR-7, NFR-1, NFR-2, NFR-3, NFR-4]
 
 Plans:
