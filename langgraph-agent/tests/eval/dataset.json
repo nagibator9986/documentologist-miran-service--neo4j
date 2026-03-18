@@ -277,5 +277,95 @@
     "expected_json_valid": null,
     "category": "retrieval",
     "tags": ["search", "retrieval", "prudential"]
+  },
+  {
+    "id": "probe-01",
+    "query": "порядок открытия депозитного вклада физическим лицом",
+    "expected_intent": "search",
+    "expected_docs": ["depozity.pdf", "bankovskie_operacii.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "deposits", "probe"]
+  },
+  {
+    "id": "probe-02",
+    "query": "ставка рефинансирования Национального Банка",
+    "expected_intent": "search",
+    "expected_docs": ["zakon_o_bankah.pdf", "prudencialnye_normativy.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "rates", "probe"]
+  },
+  {
+    "id": "probe-03",
+    "query": "требования к заёмщику при получении кредита",
+    "expected_intent": "search",
+    "expected_docs": ["bankovskie_operacii.pdf", "zakon_o_bankah.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "credit", "probe"]
+  },
+  {
+    "id": "probe-04",
+    "query": "залог имущества как обеспечение кредита",
+    "expected_intent": "search",
+    "expected_docs": ["bankovskie_operacii.pdf", "zakon_o_bankah.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "collateral", "probe"]
+  },
+  {
+    "id": "probe-05",
+    "query": "условия кредитования юридических лиц",
+    "expected_intent": "search",
+    "expected_docs": ["bankovskie_operacii.pdf", "zakon_o_bankah.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "credit", "probe"]
+  },
+  {
+    "id": "probe-06",
+    "query": "процентная ставка по займу в банке",
+    "expected_intent": "search",
+    "expected_docs": ["bankovskie_operacii.pdf", "prudencialnye_normativy.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "rates", "probe"]
+  },
+  {
+    "id": "probe-07",
+    "query": "права вкладчика при банкротстве банка",
+    "expected_intent": "search",
+    "expected_docs": ["depozity.pdf", "likvidaciya.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "deposits", "probe"]
+  },
+  {
+    "id": "probe-08",
+    "query": "обязанности банка перед вкладчиком",
+    "expected_intent": "search",
+    "expected_docs": ["depozity.pdf", "zakon_o_bankah.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "obligations", "probe"]
+  },
+  {
+    "id": "probe-09",
+    "query": "страхование депозитов в Казахстане",
+    "expected_intent": "search",
+    "expected_docs": ["depozity.pdf", "zakon_o_bankah.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "insurance", "probe"]
+  },
+  {
+    "id": "probe-10",
+    "query": "порядок погашения кредита досрочно",
+    "expected_intent": "search",
+    "expected_docs": ["bankovskie_operacii.pdf", "zakon_o_bankah.pdf"],
+    "expected_json_valid": null,
+    "category": "retrieval",
+    "tags": ["search", "retrieval", "credit", "probe"]
   }
 ]
