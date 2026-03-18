@@ -2,25 +2,25 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: unknown
-stopped_at: Completed 03-04-PLAN.md
-last_updated: "2026-03-18T04:57:21.009Z"
+status: in-progress
+stopped_at: "Completed 04-02-PLAN.md"
+last_updated: "2026-03-18T05:32:01.000Z"
 progress:
   total_phases: 5
   completed_phases: 3
-  total_plans: 11
-  completed_plans: 11
+  total_plans: 14
+  completed_plans: 12
 ---
 
 # Project State
 
 ## Current Status
-**Phase:** Phase 3 — Retrieval Calibration (Complete, 4 of 4 plans done)
+**Phase:** Phase 4 — Agent Logic Hardening (In Progress, 2 of 3 plans done)
 **Milestone:** 1 — Production-Ready Agent System
 **Date:** 2026-03-18
 
 ## Active Work
-Phase 3 complete. All 4 plans done. Query expansion removed, thresholds calibrated, score stats added, analyze_agent parity achieved, 10 probing entries added to eval dataset (41 total). Eval run pending live API deployment.
+Phase 4 in progress. Plan 01 (supervisor keyword expansion) status unknown. Plan 02 (compare dedup) complete -- _retrieve_compare_pair removed, compare path now makes 2 Qdrant calls instead of 4. Plan 03 (hallucination guard + degradation) pending.
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
@@ -34,6 +34,9 @@ Phase 3 complete. All 4 plans done. Query expansion removed, thresholds calibrat
 - [x] Phase 3 Plan 02 — Score statistics (min/max/p50) in search_node metrics (commit: 93d28cc)
 - [x] Phase 3 Plan 03 — Analyze agent retrieval parity: pre-filter, INFO logging, stage_counts, metrics expansion (commits: e91f92a, 8018d78)
 - [x] Phase 3 Plan 04 — 10 probing retrieval entries in eval dataset, 41 total queries (commit: e21016e)
+
+## Completed
+- [x] Phase 4 Plan 02 — Compare dedup: removed _retrieve_compare_pair, 4->2 Qdrant calls (commit: 97dfa13)
 
 ## Key Decisions
 - **Removed query expansion entirely** — 7b model drops key legal terms, causing false negatives
@@ -57,6 +60,7 @@ Phase 3 complete. All 4 plans done. Query expansion removed, thresholds calibrat
 - **Fallback dict includes _parse_failed=True** — maintains backward compat with json_parse_success metric
 - **Probe expected_docs from existing entries** — used filenames from retrieval-01..08 as source of truth since API not running
 - **Eval run deferred** — plan accounts for API-not-running case; documented verification commands
+- **Deleted _retrieve_compare_pair entirely** — function was purely wasteful, _retrieve_and_rerank already provides full pipeline
 
 ## Critical Context
 - Код находится в: `documentologist-miran-service--neo4j/langgraph-agent/`
@@ -69,7 +73,7 @@ Phase 3 complete. All 4 plans done. Query expansion removed, thresholds calibrat
 - Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Completed 03-04-PLAN.md
+Stopped at: Completed 04-02-PLAN.md
 
 ## Next Action
-Phase 3 complete. Begin Phase 4 planning or execute next milestone phase. Eval run (retrieval_recall_at_5 >= 0.80) pending live API deployment.
+Continue Phase 4: Plan 01 (supervisor keyword expansion) and Plan 03 (hallucination guard + degradation) remain. Eval run (retrieval_recall_at_5 >= 0.80) pending live API deployment.
