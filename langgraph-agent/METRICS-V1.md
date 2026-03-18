@@ -10,6 +10,21 @@
 | System crash on LLM timeout | 0 | Integration tests + graceful degradation (Phase 4) |
 | Integration tests passing | 100% | `make test` |
 
+## Latency Targets (NFR-2)
+
+Per-agent P95 latency pass/fail thresholds measured by `p95_elapsed_s` in eval output:
+
+| Agent / Task | P95 Target | How Measured |
+|-------------|------------|--------------|
+| search | < 30s | `p95_elapsed_s` for category=routing queries with expected_intent=search |
+| analyze (qa/compare/extract/summary) | < 30s | `p95_elapsed_s` for category=routing queries with expected_intent=analyze |
+| verify | < 30s | `p95_elapsed_s` for category=json_validity queries with expected_intent=verify |
+| generate | < 90s | `p95_elapsed_s` for category=json_validity queries with expected_intent=generate |
+| supervisor classification | < 2s | Time from request receipt to intent determination (logged as supervisor elapsed) |
+
+**Note:** These thresholds assume qwen2.5:14b running locally via Ollama. Larger models
+or remote inference will have different latency profiles. Adjust targets accordingly.
+
 ## How to Run
 
 ### Unit + Integration Tests (no live services needed)
