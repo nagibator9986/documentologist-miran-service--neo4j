@@ -3,24 +3,24 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: in-progress
-stopped_at: "Completed 04-01-PLAN.md"
-last_updated: "2026-03-18T07:14:00.000Z"
+stopped_at: Completed 04-03-PLAN.md
+last_updated: "2026-03-18T09:38:08.253Z"
 progress:
   total_phases: 5
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 14
-  completed_plans: 13
+  completed_plans: 14
 ---
 
 # Project State
 
 ## Current Status
-**Phase:** Phase 4 — Agent Logic Hardening (In Progress, 2 of 3 plans done)
+**Phase:** Phase 4 — Agent Logic Hardening (Complete, 3 of 3 plans done)
 **Milestone:** 1 — Production-Ready Agent System
 **Date:** 2026-03-18
 
 ## Active Work
-Phase 4 in progress. Plan 01 (supervisor keyword expansion) complete -- 14 new patterns, normalized logging, 8 eval entries. Plan 02 (compare dedup) complete -- _retrieve_compare_pair removed, compare path now makes 2 Qdrant calls instead of 4. Plan 03 (hallucination guard + degradation) pending.
+Phase 4 complete. All 3 plans done: Plan 01 (supervisor keyword expansion), Plan 02 (compare dedup), Plan 03 (hallucination guard + graceful degradation).
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
@@ -38,6 +38,7 @@ Phase 4 in progress. Plan 01 (supervisor keyword expansion) complete -- 14 new p
 ## Completed
 - [x] Phase 4 Plan 01 — Supervisor keyword expansion: 14 new patterns, normalized logging, 8 routing eval entries (commits: 646b333, 41f2c24)
 - [x] Phase 4 Plan 02 — Compare dedup: removed _retrieve_compare_pair, 4->2 Qdrant calls (commit: 97dfa13)
+- [x] Phase 4 Plan 03 — Hallucination guard + graceful degradation: search/analyze empty guards, HTTP 500->200 (commits: d878e11, 22c4c87)
 
 ## Key Decisions
 - **Removed query expansion entirely** — 7b model drops key legal terms, causing false negatives
@@ -64,6 +65,9 @@ Phase 4 in progress. Plan 01 (supervisor keyword expansion) complete -- 14 new p
 - **Deleted _retrieve_compare_pair entirely** — function was purely wasteful, _retrieve_and_rerank already provides full pipeline
 - **Negative lookahead on можно ли** — excludes procedural queries (получить/оформить/подать) from verify routing
 - **Domain-specific informational section in _SEARCH_KW** — порядок, условия, требования, ставка, обязанности, процедура, страхование
+- **Hallucination guard retries once only** — avoids infinite loops if model consistently stubs
+- **HTTP 500 replaced with 200 + error payload** — clients always get parseable responses
+- **memory_agent Redis failure confirmed non-fatal** — no changes needed, both nodes already wrap Redis in try/except
 
 ## Critical Context
 - Код находится в: `documentologist-miran-service--neo4j/langgraph-agent/`
@@ -76,7 +80,7 @@ Phase 4 in progress. Plan 01 (supervisor keyword expansion) complete -- 14 new p
 - Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Completed 04-01-PLAN.md
+Stopped at: Completed 04-03-PLAN.md
 
 ## Next Action
-Phase 4: Plan 03 (hallucination guard + degradation) remains. Plans 01 and 02 complete. Eval run (retrieval_recall_at_5 >= 0.80) pending live API deployment.
+Phase 4 complete (all 3 plans). Phase 5 (integration eval) is next. Eval run (retrieval_recall_at_5 >= 0.80) pending live API deployment.
