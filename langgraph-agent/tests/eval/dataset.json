@@ -367,5 +367,61 @@
     "expected_json_valid": null,
     "category": "retrieval",
     "tags": ["search", "retrieval", "credit", "probe"]
+  },
+  {
+    "id": "route-14",
+    "query": "верно ли что банк обязан создать службу внутреннего аудита",
+    "expected_intent": "verify",
+    "category": "routing",
+    "tags": ["routing", "keyword", "verify"]
+  },
+  {
+    "id": "route-15",
+    "query": "допустимо ли включать штрафные санкции в договор ипотеки",
+    "expected_intent": "verify",
+    "category": "routing",
+    "tags": ["routing", "keyword", "verify"]
+  },
+  {
+    "id": "route-16",
+    "query": "имеет ли право заёмщик на досрочное погашение",
+    "expected_intent": "verify",
+    "category": "routing",
+    "tags": ["routing", "keyword", "verify"]
+  },
+  {
+    "id": "route-17",
+    "query": "вправе ли банк изменить процентную ставку в одностороннем порядке",
+    "expected_intent": "verify",
+    "category": "routing",
+    "tags": ["routing", "keyword", "verify"]
+  },
+  {
+    "id": "route-18",
+    "query": "условия кредитования юридических лиц",
+    "expected_intent": "search",
+    "category": "routing",
+    "tags": ["routing", "keyword", "search"]
+  },
+  {
+    "id": "route-19",
+    "query": "порядок погашения ипотечного кредита",
+    "expected_intent": "search",
+    "category": "routing",
+    "tags": ["routing", "keyword", "search"]
+  },
+  {
+    "id": "route-20",
+    "query": "обязанности банка перед вкладчиками",
+    "expected_intent": "search",
+    "category": "routing",
+    "tags": ["routing", "keyword", "search"]
+  },
+  {
+    "id": "route-21",
+    "query": "проанализируй основные положения этого документа",
+    "expected_intent": "analyze",
+    "category": "routing",
+    "tags": ["routing", "keyword", "analyze"]
   }
 ]
