@@ -92,7 +92,6 @@ def _build_state(query: str, session_id: str, user_id: str) -> dict:
         "intent":            "",
         "intents":           [],
         "document_ids":      [],
-        "query_expanded":    "",
         "vector_hits":       [],
         "bm25_hits":         [],
         "graph_hits":        [],

@@ -105,7 +105,6 @@ def _build_initial_state(req: ChatRequest) -> dict:
         "intents": [],
         "tier": "",
         "document_ids": req.document_ids,
-        "query_expanded": "",
         "vector_hits": [],
         "bm25_hits": [],
         "graph_hits": [],

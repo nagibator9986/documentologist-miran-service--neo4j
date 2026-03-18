@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.parse
 import uuid
 from typing import Any
 
@@ -201,39 +200,19 @@ async def on_message(message: cl.Message) -> None:
         await _render_metrics(done_data["retrieval_metrics"])
 
 
-# ── File upload → ingest ──────────────────────────────────────────────────────
+# ── File upload → redirect to OCR service ────────────────────────────────────
 
 async def _handle_file_upload(message: cl.Message) -> None:
-    """Send uploaded files to the ingest endpoint."""
-    session_id = cl.user_session.get("session_id")
-
-    for element in message.elements:
-        if not isinstance(element, cl.File):
-            continue
-
-        await cl.Message(content=f"📥 Загружаю `{element.name}`…").send()
-
-        try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                with open(element.path, "rb") as f:
-                    resp = await client.post(
-                        f"{AGENT_URL}/api/v1/ingest/upload",
-                        files={"file": (element.name, f, element.mime or "application/octet-stream")},
-                        data={"session_id": session_id},
-                    )
-                resp.raise_for_status()
-
-            await cl.Message(
-                content=(
-                    f"✅ **`{element.name}`** успешно загружен и проиндексирован.\n\n"
-                    "Теперь можно задавать вопросы по этому документу."
-                )
-            ).send()
-
-        except Exception as exc:
-            await cl.Message(
-                content=f"❌ Ошибка при загрузке `{element.name}`: {exc}"
-            ).send()
+    """Redirect file uploads to the dedicated OCR service."""
+    await cl.Message(
+        content=(
+            "📁 **Загрузка файлов**\n\n"
+            "Для загрузки и обработки документов используйте **OCR-сервис**: "
+            "http://localhost:8504\n\n"
+            "После того как документ будет обработан, он станет доступен "
+            "для поиска в этом чате."
+        )
+    ).send()
 
 
 # ── Verify card ───────────────────────────────────────────────────────────────
@@ -393,8 +372,6 @@ async def _render_metrics(metrics: dict) -> None:
         parts.append(f"🕸 graph `{graph_hits}`")
     if metrics.get("is_exact_search"):
         parts.append("🔎 точный поиск")
-    if metrics.get("query_expanded"):
-        parts.append("✨ запрос расширен")
 
     if parts:
         await cl.Message(content="*" + " · ".join(parts) + "*").send()

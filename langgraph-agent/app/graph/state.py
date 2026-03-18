@@ -16,7 +16,6 @@ class RetrievalMetrics(TypedDict, total=False):
     graph_hits: int            # chunks added from Neo4j
     best_rerank_score: float   # top cross-encoder sigmoid score
     is_exact_search: bool      # True when phrase-match query was used
-    query_expanded: bool       # True when query was rewritten by LLM
     doc_content_len: int       # characters of document content verified
     risk_score: int            # verify_node compliance risk (0-10)
 
@@ -40,10 +39,6 @@ class AgentState(TypedDict):
     tier: str
     # document IDs the user mentioned / uploaded
     document_ids: list[str]
-
-    # ── Query processing ──────────────────────────────────────────────
-    # LLM-rewritten query for better vector retrieval (equals user_query if expansion skipped)
-    query_expanded: str
 
     # ── Retrieved context ─────────────────────────────────────────────
     vector_hits: list[dict[str, Any]]    # from Qdrant
