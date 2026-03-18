@@ -40,7 +40,7 @@ from ..core.utils import (
 )
 from ..graph.state import AgentState
 from ..prompts import SEARCH_EXPERT
-from ..tools.bm25_search import bm25_search
+from ..tools.bm25_search import bm25_search, corpus_bm25_search
 from ..tools.neo4j_query import (
     graph_entity_lookup,
     graph_obligation_search,
@@ -223,11 +223,14 @@ def _retrieve_exact(exact_text: str, s: Settings) -> list[dict]:
 
 def _retrieve_vector_bm25(
     embed_query: str, lexical_query: str, s: Settings
-) -> tuple[list[dict], list[dict]]:
-    """Run Qdrant vector search, then BM25 over its results.
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Vector search + BM25 rerank over its results + full-corpus BM25.
+
+    Full-corpus BM25 catches documents that vector search misses (e.g. exact
+    article numbers, law names, KZT amounts with low semantic similarity).
 
     Returns:
-        (vector_hits, bm25_hits)
+        (vector_hits, bm25_hits, corpus_bm25_hits)
     """
     vector_hits = qdrant_search.invoke({
         "query": embed_query,
@@ -239,7 +242,12 @@ def _retrieve_vector_bm25(
         "documents": vector_hits,
         "top_k": s.bm25_top_k,
     })
-    return vector_hits, bm25_hits
+    corpus_hits = corpus_bm25_search(
+        query=lexical_query,
+        top_k=s.bm25_top_k,
+        collection=s.qdrant_collection,
+    )
+    return vector_hits, bm25_hits, corpus_hits
 
 
 # ── Stage 5: Parallel Neo4j graph enrichment ─────────────────────────────────
@@ -416,6 +424,7 @@ def _merge_all_hits(
     exact_hits: list[dict],
     vector_hits: list[dict],
     bm25_hits: list[dict],
+    corpus_bm25_hits: list[dict],
     graph_hits: list[dict],
 ) -> tuple[list[dict], set[str]]:
     """Combine all hit sources into a single deduplicated list.
@@ -424,13 +433,13 @@ def _merge_all_hits(
     it, so they are returned separately in the second position.
 
     Returns:
-        (qdrant_merged, seen_ids) — qdrant_merged contains exact+vector+bm25 hits.
+        (qdrant_merged, seen_ids) — qdrant_merged contains exact+vector+bm25+corpus hits.
         seen_ids is passed to stage 8 to avoid double-adding graph hits.
     """
     seen_ids: set[str] = set()
     merged: list[dict] = []
 
-    for idx, hit in enumerate(exact_hits + vector_hits + bm25_hits):
+    for idx, hit in enumerate(exact_hits + vector_hits + bm25_hits + corpus_bm25_hits):
         raw_id = hit.get("id")
         hit_id = str(raw_id) if raw_id else f"idx:{idx}:{hash(hit.get('content', ''))}"
         if hit_id not in seen_ids:
@@ -599,15 +608,15 @@ def search_node(state: AgentState) -> AgentState:
     exact_hits = _retrieve_exact(exact_text, s) if is_exact else []
     exact_hit_ids = {str(h.get("id")) for h in exact_hits if h.get("id")}
 
-    # 4. Vector + BM25
-    vector_hits, bm25_hits = _retrieve_vector_bm25(embed_query, lexical_query, s)
+    # 4. Vector + BM25 (inline rerank) + full-corpus BM25
+    vector_hits, bm25_hits, corpus_hits = _retrieve_vector_bm25(embed_query, lexical_query, s)
 
     # 5-6. Graph enrichment + normalization
     graph_results = _retrieve_graph(lexical_query, s)
     graph_hits = _normalize_graph_hits(graph_results, s)
 
     # 7. Merge all sources
-    merged, _ = _merge_all_hits(exact_hits, vector_hits, bm25_hits, graph_hits)
+    merged, _ = _merge_all_hits(exact_hits, vector_hits, bm25_hits, corpus_hits, graph_hits)
 
     # 8. Relevance filter
     relevant = _filter_by_relevance(merged, s)
@@ -653,6 +662,7 @@ def search_node(state: AgentState) -> AgentState:
         "query_len": len(lexical_query),
         "vector_hits": len(vector_hits),
         "bm25_hits": len(bm25_hits),
+        "corpus_bm25_hits": len(corpus_hits),
         "graph_hits": len(graph_hits),
         "entity_hits": len(graph_results.get("entities", [])),
         "law_hits": len(graph_results.get("laws", [])),

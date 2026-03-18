@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+import time
 from typing import Any
 
 from langchain_core.tools import tool
@@ -59,3 +61,88 @@ def bm25_search(query: str, documents: list[dict[str, Any]], top_k: int = 20) ->
 
     logger.debug("bm25_search '%s' → %d hits", query, len(results))
     return results
+
+
+class _CorpusBM25Index:
+    """In-memory BM25 index over the full Qdrant collection with TTL-based refresh.
+
+    Singleton — one instance per process. Thread-safe via a lock.
+    """
+
+    _TTL: float = 300.0  # rebuild at most once per 5 minutes
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._corpus: list[dict[str, Any]] = []
+        self._bm25: Any = None
+        self._built_at: float = 0.0
+
+    def _stale(self) -> bool:
+        return time.monotonic() - self._built_at > self._TTL
+
+    def _rebuild(self, chunks: list[dict[str, Any]]) -> None:
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError as exc:
+            raise RuntimeError("corpus_bm25_search requires `rank-bm25`. Install: pip install rank-bm25") from exc
+        corpus = [_tokenize(c.get("content", "")) for c in chunks]
+        corpus = [t or ["__empty__"] for t in corpus]
+        self._corpus = chunks
+        self._bm25 = BM25Okapi(corpus)
+        self._built_at = time.monotonic()
+        logger.info("CorpusBM25: index rebuilt — %d chunks", len(chunks))
+
+    def search(self, query: str, top_k: int, loader: Any) -> list[dict[str, Any]]:
+        with self._lock:
+            if self._stale() or not self._corpus:
+                chunks = loader()
+                if not chunks:
+                    return []
+                self._rebuild(chunks)
+            if not self._bm25:
+                return []
+            tokens = _tokenize(query)
+            if not tokens:
+                return []
+            scores = self._bm25.get_scores(tokens)
+            indexed = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
+            max_score = scores[indexed[0][0]] if indexed else 0.0
+            results: list[dict[str, Any]] = []
+            for idx, raw_score in indexed:
+                if raw_score <= 0:
+                    break
+                hit = dict(self._corpus[idx])
+                hit["bm25_score"] = round(float(raw_score), 4)
+                # Normalize to 0–0.6 (below strong vector hits, above relevance filter)
+                hit["score"] = round(min(0.6, raw_score / max_score * 0.6), 4) if max_score > 0 else 0.3
+                results.append(hit)
+            logger.debug("CorpusBM25.search '%s' → %d hits", query, len(results))
+            return results
+
+
+_corpus_index = _CorpusBM25Index()
+
+
+def corpus_bm25_search(
+    query: str,
+    top_k: int = 20,
+    collection: str = "",
+) -> list[dict[str, Any]]:
+    """BM25 search over the entire Qdrant corpus (catches what vector search misses).
+
+    On first call loads all chunks from Qdrant; result is cached with 5-minute TTL.
+
+    Args:
+        query: Search query string.
+        top_k: Maximum results to return.
+        collection: Qdrant collection name (uses default if empty).
+
+    Returns:
+        Ranked hit dicts with score normalised to 0–0.6.
+    """
+    from .qdrant_search import scroll_all_chunks
+
+    def _loader() -> list[dict[str, Any]]:
+        return scroll_all_chunks(collection=collection)
+
+    return _corpus_index.search(query, top_k=top_k, loader=_loader)

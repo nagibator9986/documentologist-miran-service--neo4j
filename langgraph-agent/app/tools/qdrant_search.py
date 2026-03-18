@@ -90,6 +90,61 @@ def qdrant_search(
     return hits
 
 
+def scroll_all_chunks(
+    collection: str = "",
+    max_chunks: int = 50_000,
+) -> list[dict[str, Any]]:
+    """Load all chunks from Qdrant for full-corpus BM25 indexing.
+
+    Args:
+        collection: Qdrant collection name (uses default if empty).
+        max_chunks: Hard cap to prevent OOM on very large collections.
+
+    Returns:
+        List of hit dicts with id, content, question, section, metadata, score=0.
+    """
+    s = get_settings()
+    col = collection or s.qdrant_collection
+    client = get_qdrant_client()
+
+    all_chunks: list[dict[str, Any]] = []
+    offset = None
+    _BATCH = 500
+
+    while len(all_chunks) < max_chunks:
+        try:
+            records, next_offset = client.scroll(
+                collection_name=col,
+                limit=_BATCH,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:
+            logger.warning("scroll_all_chunks: scroll failed at offset=%s: %s", offset, exc)
+            break
+
+        for r in records:
+            payload = r.payload or {}
+            content = payload.get("answer") or payload.get("text", "")
+            if content:
+                all_chunks.append({
+                    "id": str(r.id),
+                    "content": content,
+                    "question": payload.get("question", ""),
+                    "section": payload.get("section_title", ""),
+                    "metadata": payload,
+                    "score": 0.0,
+                })
+
+        if not records or next_offset is None or len(records) < _BATCH:
+            break
+        offset = next_offset
+
+    logger.info("scroll_all_chunks: loaded %d chunks from '%s'", len(all_chunks), col)
+    return all_chunks
+
+
 def qdrant_scroll_by_doc_ids(
     doc_ids: list[str],
     max_chunks_per_doc: int = 10,
