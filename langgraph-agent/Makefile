@@ -2,7 +2,7 @@ PYTHON ?= .venv/bin/python
 PIP    ?= .venv/bin/pip
 UV     ?= uv
 
-.PHONY: install venv infra-up infra-down dev build run lint test
+.PHONY: install venv infra-up infra-down dev build run lint test eval docker-prod-up docker-prod-down
 
 venv:
 	python3 -m venv .venv
@@ -36,3 +36,12 @@ test:
 
 lint:
 	$(PYTHON) -m ruff check app/
+
+eval:
+	$(PYTHON) tests/eval/run_eval.py
+
+docker-prod-up:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml --compatibility up -d
+
+docker-prod-down:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml down
