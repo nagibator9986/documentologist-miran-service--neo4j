@@ -3,24 +3,24 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 03-02-PLAN.md
-last_updated: "2026-03-18T04:14:54.922Z"
+stopped_at: Completed 03-01-PLAN.md
+last_updated: "2026-03-18T04:17:00.000Z"
 progress:
   total_phases: 5
   completed_phases: 2
   total_plans: 11
-  completed_plans: 8
+  completed_plans: 9
 ---
 
 # Project State
 
 ## Current Status
-**Phase:** Phase 3 — Retrieval Calibration (Plan 2 of 4 complete)
+**Phase:** Phase 3 — Retrieval Calibration (Plan 2 of 4 complete, Plan 1 also complete)
 **Milestone:** 1 — Production-Ready Agent System
 **Date:** 2026-03-18
 
 ## Active Work
-Phase 3 in progress. Plan 03-02 (score statistics) complete. Score distribution stats (min/max/p50) added to search_node metrics.
+Phase 3 in progress. Plans 03-01 and 03-02 complete. Query expansion removed, thresholds calibrated, score distribution stats added.
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
@@ -30,9 +30,13 @@ Phase 3 in progress. Plan 03-02 (score statistics) complete. Score distribution 
 - [x] Phase 1 Plan 03 — Agent metrics enrichment + eval runner script (commits: 13ffc3e, dff09eb)
 
 ## Completed
+- [x] Phase 3 Plan 01 — Query expansion removal + threshold calibration (commits: 434b651, 0a56eaa, a7b0273)
 - [x] Phase 3 Plan 02 — Score statistics (min/max/p50) in search_node metrics (commit: 93d28cc)
 
 ## Key Decisions
+- **Removed query expansion entirely** — 7b model drops key legal terms, causing false negatives
+- **min_relevance_score 0.35->0.25** — gives cross-encoder more candidates in normal path
+- **search_min_confidence 0.25->0.15** — sigmoid scores on Russian text cluster 0.15-0.30
 - **Used statistics.median for p50** — stdlib, no external dependency
 - **Empty score list returns {} not zeros** — clean metrics when stage has no hits
 - **No rewrite** — evolutionary improvement of existing agents
@@ -59,7 +63,7 @@ Phase 3 in progress. Plan 03-02 (score statistics) complete. Score distribution 
 - Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Completed 03-02-PLAN.md
+Stopped at: Completed 03-01-PLAN.md
 
 ## Next Action
-Execute remaining Phase 3 plans (03-01, 03-03, 03-04).
+Execute remaining Phase 3 plans (03-03, 03-04).

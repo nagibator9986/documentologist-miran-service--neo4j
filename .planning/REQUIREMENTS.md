@@ -8,10 +8,11 @@
 - При parse failure — возвращать осмысленный fallback ответ (не сырой JSON)
 - Валидировать структуру по Pydantic-схеме перед отправкой пользователю
 
-### FR-2: Retrieval — No False Negatives
+### FR-2: Retrieval — No False Negatives [IN PROGRESS - Phase 3]
 Если документ проиндексирован в Qdrant:
-- Поисковый агент должен его находить при прямом вопросе по его содержимому
-- Пороги `min_relevance_score` и `search_min_confidence` должны быть откалиброваны так, чтобы не срезать релевантные результаты
+- [x] Поисковый агент должен его находить при прямом вопросе по его содержимому
+- [x] Пороги `min_relevance_score` и `search_min_confidence` должны быть откалиброваны так, чтобы не срезать релевантные результаты (03-01: 0.35->0.25, 0.25->0.15)
+- [x] Query expansion removed -- 7b model was dropping key legal terms (03-01)
 - Диагностический endpoint `/api/v1/debug/retrieval` — показывает scores всех retrieval stages
 
 ### FR-3: Supervisor Routing Accuracy [COMPLETE - Phase 1]
