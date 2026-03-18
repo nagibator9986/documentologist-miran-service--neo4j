@@ -52,6 +52,24 @@ from ..tools.reranker import reranker
 
 logger = logging.getLogger(__name__)
 
+# ── Hallucination guard: LLM sometimes claims "no info" despite having context ─
+_HALLUCINATION_STUBS = re.compile(
+    r"(?:у меня нет (?:информации|данных)"
+    r"|не располагаю информацией"
+    r"|не (?:могу|удалось) найти (?:информацию|данные|ответ)"
+    r"|в (?:предоставленных|загруженных) документах не найдено"
+    r"|в базе знаний не найдено"
+    r"|к сожалению.{0,30}(?:нет информации|не найдено))",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# ── Graceful degradation message when Ollama is unreachable ──────────────────
+_OLLAMA_UNAVAILABLE_MSG = (
+    "К сожалению, языковая модель временно недоступна. "
+    "Найденные документы доступны в цитатах ниже. "
+    "Попробуйте повторить запрос через несколько минут."
+)
+
 # ── Module-level thread pool for parallel Neo4j queries ──────────────────────
 # Lazy singleton with double-checked locking — created once, reused per request.
 # Prevents unbounded thread creation when many requests arrive simultaneously.
@@ -604,6 +622,23 @@ def search_node(state: AgentState) -> AgentState:
     )
     answer = _generate_answer(user_msg, state, s)
 
+    # Hallucination guard: retry once if LLM stubs despite having context
+    if has_context and answer.strip() and _HALLUCINATION_STUBS.search(answer):
+        logger.warning(
+            "search_node: hallucination stub detected with has_context=True, retrying"
+        )
+        retry_prompt = (
+            f"{user_msg}\n\n"
+            "ВАЖНО: Ответь на основе предоставленного контекста. "
+            "Документы содержат релевантную информацию — используй её."
+        )
+        answer = _generate_answer(retry_prompt, state, s)
+
+    # Empty answer guard: Ollama may be down (invoke_with_retry returns "")
+    if not answer.strip():
+        logger.error("search_node: LLM returned empty response (Ollama may be down)")
+        answer = _OLLAMA_UNAVAILABLE_MSG
+
     # 12. Citations
     citations = _build_citations(reranked, exact_hit_ids, s)
 
@@ -631,6 +666,8 @@ def search_node(state: AgentState) -> AgentState:
         "is_exact_search": is_exact,
         "elapsed_s": round(elapsed, 2),
     }
+    if answer == _OLLAMA_UNAVAILABLE_MSG:
+        metrics["degraded"] = True
     logger.info("search_node metrics: %s", metrics)
 
     return {
