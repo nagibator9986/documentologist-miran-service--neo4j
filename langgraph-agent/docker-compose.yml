@@ -73,6 +73,12 @@ services:
         condition: service_healthy
     volumes:
       - agent_exports:/exports
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   # ── Qdrant ─────────────────────────────────────────────────────────────────
   qdrant:
