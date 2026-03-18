@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: in-progress
-stopped_at: "Completed 04-02-PLAN.md"
-last_updated: "2026-03-18T05:32:01.000Z"
+stopped_at: "Completed 04-01-PLAN.md"
+last_updated: "2026-03-18T07:14:00.000Z"
 progress:
   total_phases: 5
   completed_phases: 3
   total_plans: 14
-  completed_plans: 12
+  completed_plans: 13
 ---
 
 # Project State
@@ -20,7 +20,7 @@ progress:
 **Date:** 2026-03-18
 
 ## Active Work
-Phase 4 in progress. Plan 01 (supervisor keyword expansion) status unknown. Plan 02 (compare dedup) complete -- _retrieve_compare_pair removed, compare path now makes 2 Qdrant calls instead of 4. Plan 03 (hallucination guard + degradation) pending.
+Phase 4 in progress. Plan 01 (supervisor keyword expansion) complete -- 14 new patterns, normalized logging, 8 eval entries. Plan 02 (compare dedup) complete -- _retrieve_compare_pair removed, compare path now makes 2 Qdrant calls instead of 4. Plan 03 (hallucination guard + degradation) pending.
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
@@ -36,6 +36,7 @@ Phase 4 in progress. Plan 01 (supervisor keyword expansion) status unknown. Plan
 - [x] Phase 3 Plan 04 — 10 probing retrieval entries in eval dataset, 41 total queries (commit: e21016e)
 
 ## Completed
+- [x] Phase 4 Plan 01 — Supervisor keyword expansion: 14 new patterns, normalized logging, 8 routing eval entries (commits: 646b333, 41f2c24)
 - [x] Phase 4 Plan 02 — Compare dedup: removed _retrieve_compare_pair, 4->2 Qdrant calls (commit: 97dfa13)
 
 ## Key Decisions
@@ -61,6 +62,8 @@ Phase 4 in progress. Plan 01 (supervisor keyword expansion) status unknown. Plan
 - **Probe expected_docs from existing entries** — used filenames from retrieval-01..08 as source of truth since API not running
 - **Eval run deferred** — plan accounts for API-not-running case; documented verification commands
 - **Deleted _retrieve_compare_pair entirely** — function was purely wasteful, _retrieve_and_rerank already provides full pipeline
+- **Negative lookahead on можно ли** — excludes procedural queries (получить/оформить/подать) from verify routing
+- **Domain-specific informational section in _SEARCH_KW** — порядок, условия, требования, ставка, обязанности, процедура, страхование
 
 ## Critical Context
 - Код находится в: `documentologist-miran-service--neo4j/langgraph-agent/`
@@ -69,11 +72,11 @@ Phase 4 in progress. Plan 01 (supervisor keyword expansion) status unknown. Plan
 - Промпты: `app/prompts/` (не читались — нужно проверить в Phase 2)
 - JSON агенты используют `get_json_llm` из `app/core/llm.py` — нужно проверить реализацию
 - Structured logging: `app/core/logging_config.py` — setup_logging(log_level, log_format)
-- Eval dataset: `tests/eval/dataset.json` (41 queries: 13 routing, 10 json_validity, 18 retrieval)
+- Eval dataset: `tests/eval/dataset.json` (49 queries: 21 routing, 10 json_validity, 18 retrieval)
 - Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Completed 04-02-PLAN.md
+Stopped at: Completed 04-01-PLAN.md
 
 ## Next Action
-Continue Phase 4: Plan 01 (supervisor keyword expansion) and Plan 03 (hallucination guard + degradation) remain. Eval run (retrieval_recall_at_5 >= 0.80) pending live API deployment.
+Phase 4: Plan 03 (hallucination guard + degradation) remains. Plans 01 and 02 complete. Eval run (retrieval_recall_at_5 >= 0.80) pending live API deployment.

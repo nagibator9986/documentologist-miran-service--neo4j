@@ -73,7 +73,7 @@ Plans:
 
 ## Phase 4: Agent Logic Hardening
 **Goal:** Устранить оставшиеся edge cases в routing и ответах агентов.
-**Plans:** 3 plans
+**Plans:** 2/3 plans executed
 **Requirements:** [P4-ROUTE, P4-DEDUP, P4-HALLUC, P4-DEGRADE, P4-EVAL]
 
 Plans:
