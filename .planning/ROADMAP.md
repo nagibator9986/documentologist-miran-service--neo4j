@@ -73,6 +73,13 @@ Plans:
 
 ## Phase 4: Agent Logic Hardening
 **Goal:** Устранить оставшиеся edge cases в routing и ответах агентов.
+**Plans:** 3 plans
+**Requirements:** [P4-ROUTE, P4-DEDUP, P4-HALLUC, P4-DEGRADE, P4-EVAL]
+
+Plans:
+- [ ] 04-01-PLAN.md — Supervisor keyword expansion + logging normalization + eval entries
+- [ ] 04-02-PLAN.md — Analyze compare double-retrieval deduplication
+- [ ] 04-03-PLAN.md — Hallucination guard + graceful degradation + Redis verification
 
 ### Tasks
 1. Расширить keyword patterns в `supervisor.py` — добавить 10+ banking/legal edge cases которые не покрыты сейчас (из eval dataset Phase 1)
