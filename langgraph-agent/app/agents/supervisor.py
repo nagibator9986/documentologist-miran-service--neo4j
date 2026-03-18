@@ -58,7 +58,7 @@ _ANALYZE_KW = re.compile(
     r"\b(сравн|сравнен|сопостав|отличи[её]|отличи[яе]|разниц[аеу]|различи[её]|различи[яе]|"
     r"резюм|суммар|краткое\s+содержани|кратк[ое]+\s+излож|суммаризу|"
     r"извлек[ии]|вытащи|вытащите|выдели\s+все|"
-    r"перечисли|перечислите|перечисление|"
+    r"перечисли|перечислите|перечисление|проанализируй|"
     r"какие\s+виды|какие\s+типы|какие\s+категории|какие\s+формы|"
     r"что\s+упоминается|что\s+упомянуто|упоминается\s+в|упомянут[оа]?\s+в|"
     r"в\s+документе\s+упомина|в\s+тексте\s+упомина|"
@@ -84,6 +84,8 @@ _VERIFY_KW = re.compile(
     # Legality checks
     r"законно\s+ли|незаконн|соответствует\s+ли|соответствует\s+нормам|"
     r"не\s+противоречит\s+ли|допустимо\s+ли|правомерн|"
+    r"верно\s+ли|допустим[оа]?\s+ли|имеет\s+ли\s+право|вправе\s+ли|"
+    r"позволяет\s+ли\s+закон|можно\s+ли\s+(?!.*(?:получить|оформить|подать))|"
     # Risk analysis
     r"оцени\s+риски|риск[ио]вый\s+анализ|правовые\s+риски"
     r")\b",
@@ -113,7 +115,10 @@ _SEARCH_KW = re.compile(
     r"найди|найдите|поищи|поищите|найти\s+информацию|"
     r"покажи\s+информацию|дай\s+информацию|предоставь\s+информацию|"
     # Procedural queries
-    r"как\s+(?:получить|оформить|подать|рассчитать|открыть|закрыть)\b"
+    r"как\s+(?:получить|оформить|подать|рассчитать|открыть|закрыть)\b|"
+    # Domain-specific informational
+    r"порядок\s+|условия\s+|требования\s+(?:к|для|по)|ставка\s+|"
+    r"обязанности\s+|процедура\s+|страхование\s+"
     r")\b",
     re.IGNORECASE | re.UNICODE,
 )
@@ -168,8 +173,8 @@ def classify_intent(state: AgentState) -> AgentState:
         if pattern.search(q_lower):
             elapsed = time.perf_counter() - t_start
             logger.info(
-                "Supervisor: compound [%s, %s] query=%r",
-                primary, secondary, query[:80],
+                "supervisor: tier=compound intent=%s secondary=%s query=%r",
+                primary, secondary, query[:60],
             )
             return {
                 **state,
@@ -189,7 +194,7 @@ def classify_intent(state: AgentState) -> AgentState:
     kw_intent = _keyword_classify(query)
     if kw_intent:
         elapsed = time.perf_counter() - t_start
-        logger.info("Supervisor: keyword intent=%s query=%r", kw_intent, query[:80])
+        logger.info("supervisor: tier=keyword intent=%s query=%r", kw_intent, query[:60])
         return {
             **state,
             "intent": kw_intent,
@@ -218,7 +223,7 @@ def classify_intent(state: AgentState) -> AgentState:
     intent: Intent = intents[0]  # type: ignore[assignment]
     elapsed = time.perf_counter() - t_start
 
-    logger.info("Supervisor: llm intent=%s query=%r raw=%r", intent, query[:80], raw[:40])
+    logger.info("supervisor: tier=llm intent=%s query=%r raw=%r", intent, query[:60], raw[:40])
     return {
         **state,
         "intent": intent,
