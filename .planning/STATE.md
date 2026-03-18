@@ -3,24 +3,24 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 04-03-PLAN.md
-last_updated: "2026-03-18T09:45:44.885Z"
+stopped_at: Completed 05-02-PLAN.md
+last_updated: "2026-03-18T10:59:32Z"
 progress:
   total_phases: 5
   completed_phases: 4
-  total_plans: 14
-  completed_plans: 14
+  total_plans: 17
+  completed_plans: 16
 ---
 
 # Project State
 
 ## Current Status
-**Phase:** Phase 4 — Agent Logic Hardening (Complete, 3 of 3 plans done)
+**Phase:** Phase 5 — Production Hardening (In Progress, 2 of 3 plans done)
 **Milestone:** 1 — Production-Ready Agent System
 **Date:** 2026-03-18
 
 ## Active Work
-Phase 4 complete. All 3 plans done: Plan 01 (supervisor keyword expansion), Plan 02 (compare dedup), Plan 03 (hallucination guard + graceful degradation).
+Phase 5 in progress. Plan 01 (pending), Plan 02 (env/docker/makefile hardening - complete), Plan 03 (pending).
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
@@ -39,6 +39,9 @@ Phase 4 complete. All 3 plans done: Plan 01 (supervisor keyword expansion), Plan
 - [x] Phase 4 Plan 01 — Supervisor keyword expansion: 14 new patterns, normalized logging, 8 routing eval entries (commits: 646b333, 41f2c24)
 - [x] Phase 4 Plan 02 — Compare dedup: removed _retrieve_compare_pair, 4->2 Qdrant calls (commit: 97dfa13)
 - [x] Phase 4 Plan 03 — Hallucination guard + graceful degradation: search/analyze empty guards, HTTP 500->200 (commits: d878e11, 22c4c87)
+
+## Completed
+- [x] Phase 5 Plan 02 — Env/Docker/Makefile hardening: 68 Settings fields in .env.example, Makefile eval/prod targets, docker-compose.prod.yml overlay (commits: adb7b2a, 4498aa8)
 
 ## Key Decisions
 - **Removed query expansion entirely** — 7b model drops key legal terms, causing false negatives
@@ -68,6 +71,11 @@ Phase 4 complete. All 3 plans done: Plan 01 (supervisor keyword expansion), Plan
 - **Hallucination guard retries once only** — avoids infinite loops if model consistently stubs
 - **HTTP 500 replaced with 200 + error payload** — clients always get parseable responses
 - **memory_agent Redis failure confirmed non-fatal** — no changes needed, both nodes already wrap Redis in try/except
+- **All 68 Settings fields documented in .env.example** — with defaults and comments
+- **docker-compose.prod.yml is overlay, not full copy** — merges on base via -f flag
+- **--compatibility flag required** — deploy.resources.limits silently ignored without Swarm
+- **langgraph-agent gets 4CPU/4G** — largest allocation due to cross-encoder workload
+- **MLFLOW_ENABLED=false in prod overlay** — reduces overhead; enable explicitly when needed
 
 ## Critical Context
 - Код находится в: `documentologist-miran-service--neo4j/langgraph-agent/`
@@ -80,7 +88,7 @@ Phase 4 complete. All 3 plans done: Plan 01 (supervisor keyword expansion), Plan
 - Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Completed 04-03-PLAN.md
+Stopped at: Completed 05-02-PLAN.md
 
 ## Next Action
-Phase 4 complete (all 3 plans). Phase 5 (integration eval) is next. Eval run (retrieval_recall_at_5 >= 0.80) pending live API deployment.
+Phase 5 Plan 02 complete. Remaining: Plan 01 and Plan 03. Production Docker config ready for deployment.
