@@ -51,7 +51,7 @@ Plans:
 
 ## Phase 3: Retrieval Calibration
 **Goal:** Документы в базе находятся корректно; убрать false negatives. Удалить query expansion, снизить пороги, привести analyze_agent к паритету с search_agent.
-**Plans:** 3/4 plans executed
+**Plans:** 4/4 plans complete
 **Requirements:** [FR-2]
 
 Plans:

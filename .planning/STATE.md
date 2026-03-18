@@ -3,24 +3,24 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 03-03-PLAN.md
-last_updated: "2026-03-18T04:25:49.182Z"
+stopped_at: Completed 03-04-PLAN.md
+last_updated: "2026-03-18T04:31:21.717Z"
 progress:
   total_phases: 5
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 11
-  completed_plans: 10
+  completed_plans: 11
 ---
 
 # Project State
 
 ## Current Status
-**Phase:** Phase 3 — Retrieval Calibration (Plan 3 of 4 complete)
+**Phase:** Phase 3 — Retrieval Calibration (Complete, 4 of 4 plans done)
 **Milestone:** 1 — Production-Ready Agent System
 **Date:** 2026-03-18
 
 ## Active Work
-Phase 3 in progress. Plans 03-01, 03-02, and 03-03 complete. Query expansion removed, thresholds calibrated, score distribution stats added, analyze_agent retrieval parity achieved.
+Phase 3 complete. All 4 plans done. Query expansion removed, thresholds calibrated, score stats added, analyze_agent parity achieved, 10 probing entries added to eval dataset (41 total). Eval run pending live API deployment.
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
@@ -33,6 +33,7 @@ Phase 3 in progress. Plans 03-01, 03-02, and 03-03 complete. Query expansion rem
 - [x] Phase 3 Plan 01 — Query expansion removal + threshold calibration (commits: 434b651, 0a56eaa, a7b0273)
 - [x] Phase 3 Plan 02 — Score statistics (min/max/p50) in search_node metrics (commit: 93d28cc)
 - [x] Phase 3 Plan 03 — Analyze agent retrieval parity: pre-filter, INFO logging, stage_counts, metrics expansion (commits: e91f92a, 8018d78)
+- [x] Phase 3 Plan 04 — 10 probing retrieval entries in eval dataset, 41 total queries (commit: e21016e)
 
 ## Key Decisions
 - **Removed query expansion entirely** — 7b model drops key legal terms, causing false negatives
@@ -54,6 +55,8 @@ Phase 3 in progress. Plans 03-01, 03-02, and 03-03 complete. Query expansion rem
 - **json_parse_success=None for analyze qa/summary** — these tasks produce free text, not JSON
 - **Removed get_json_llm/safe_parse_json from analyze_agent** — fully replaced by parse_with_retry pipeline
 - **Fallback dict includes _parse_failed=True** — maintains backward compat with json_parse_success metric
+- **Probe expected_docs from existing entries** — used filenames from retrieval-01..08 as source of truth since API not running
+- **Eval run deferred** — plan accounts for API-not-running case; documented verification commands
 
 ## Critical Context
 - Код находится в: `documentologist-miran-service--neo4j/langgraph-agent/`
@@ -62,11 +65,11 @@ Phase 3 in progress. Plans 03-01, 03-02, and 03-03 complete. Query expansion rem
 - Промпты: `app/prompts/` (не читались — нужно проверить в Phase 2)
 - JSON агенты используют `get_json_llm` из `app/core/llm.py` — нужно проверить реализацию
 - Structured logging: `app/core/logging_config.py` — setup_logging(log_level, log_format)
-- Eval dataset: `tests/eval/dataset.json` (31 queries)
+- Eval dataset: `tests/eval/dataset.json` (41 queries: 13 routing, 10 json_validity, 18 retrieval)
 - Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Completed 03-03-PLAN.md
+Stopped at: Completed 03-04-PLAN.md
 
 ## Next Action
-Execute remaining Phase 3 plan (03-04).
+Phase 3 complete. Begin Phase 4 planning or execute next milestone phase. Eval run (retrieval_recall_at_5 >= 0.80) pending live API deployment.
