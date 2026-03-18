@@ -1,7 +1,7 @@
 """Search Agent — hybrid RAG pipeline orchestrator.
 
 Pipeline stages (each is a focused private function):
-  1. _prepare_query       — referential enrichment + LLM query expansion
+  1. _prepare_query       — referential enrichment
   2. _detect_exact_search — quoted / prefix-based exact match detection
   3. _retrieve_exact      — Qdrant MatchText search for literal strings
   4. _retrieve_vector_bm25 — vector search + BM25 lexical reranking + merge
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+import statistics as _statistics
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from ..core.config import Settings, get_settings
-from ..core.llm import get_draft_llm, get_llm, invoke_with_retry
+from ..core.llm import get_llm, invoke_with_retry
 from ..core.utils import (
     DOC_REF_RE,
     build_final_response,
@@ -38,7 +39,7 @@ from ..core.utils import (
     strip_conversational_prefix,
 )
 from ..graph.state import AgentState
-from ..prompts import SEARCH_EXPERT, SEARCH_EXPAND_QUERY
+from ..prompts import SEARCH_EXPERT
 from ..tools.bm25_search import bm25_search
 from ..tools.neo4j_query import (
     graph_entity_lookup,
@@ -129,49 +130,30 @@ def _extract_graph_keywords(query: str, max_words: int) -> str:
     return " ".join(significant[:max_words])
 
 
+# ── Score statistics helper ────────────────────────────────────────────────────
+
+def _score_stats(scores: list[float]) -> dict:
+    """Return min/max/p50 for a list of scores. Returns empty dict if no scores."""
+    if not scores:
+        return {}
+    return {
+        "min": round(min(scores), 4),
+        "max": round(max(scores), 4),
+        "p50": round(_statistics.median(scores), 4),
+    }
+
+
 # ── Stage 1: Query preparation ────────────────────────────────────────────────
 
 def _prepare_query(query: str, state: AgentState) -> tuple[str, str]:
-    """Enrich referential queries and produce an expanded embedding query.
-
-    Returns:
-        (lexical_query, embed_query) — lexical keeps original wording for BM25;
-        embed_query is LLM-rewritten for better semantic recall.
-    """
-    # Strip conversational prefixes (imported from utils — shared with analyze).
+    """Enrich referential queries. Returns (query, query) — both lexical and embed use the same original query."""
     query = strip_conversational_prefix(query)
-
     if DOC_REF_RE.search(query):
         filename = extract_recent_filename(state)
         if filename:
             query = f"{filename} {query}"
             logger.info("search: referential query enriched with filename=%s", filename)
-
-    embed_query = _expand_query(query)
-    return query, embed_query
-
-
-def _expand_query(query: str) -> str:
-    """LLM rewrite for better semantic retrieval. Non-fatal — returns original on error.
-
-    Uses the draft (7b) model — query expansion needs speed, not full reasoning power.
-    Saves 30-60s per request compared to routing this through the 14b model.
-    """
-    if len(query) < 15:
-        return query
-
-    llm = get_draft_llm(temperature=0.0, num_predict=150)
-    prompt = SEARCH_EXPAND_QUERY.format(query=query)
-    try:
-        expanded = invoke_with_retry(
-            llm, [HumanMessage(content=prompt)], max_retries=1
-        ).strip()
-        if expanded and expanded != query and len(expanded) < 600:
-            logger.debug("query_expansion: '%s' -> '%s'", query[:60], expanded[:60])
-            return expanded
-    except Exception as exc:
-        logger.debug("query_expansion failed (non-critical): %s", exc)
-    return query
+    return query, query
 
 
 # ── Stage 2: Exact-string search detection ────────────────────────────────────
@@ -634,7 +616,6 @@ def search_node(state: AgentState) -> AgentState:
         "intent": state.get("intent", ""),
         "tier": state.get("tier", ""),
         "query_len": len(lexical_query),
-        "query_expanded": embed_query != lexical_query,
         "vector_hits": len(vector_hits),
         "bm25_hits": len(bm25_hits),
         "graph_hits": len(graph_hits),
@@ -643,6 +624,8 @@ def search_node(state: AgentState) -> AgentState:
         "merged_hits": len(merged),
         "relevant_hits": len(relevant),
         "reranked_hits": len(reranked),
+        "vector_score_stats": _score_stats([h.get("score", 0) for h in vector_hits]),
+        "rerank_score_stats": _score_stats([h.get("rerank_score", 0) for h in reranked]),
         "best_rerank_score": round(best_score, 4),
         "has_context": has_context,
         "is_exact_search": is_exact,
@@ -652,7 +635,6 @@ def search_node(state: AgentState) -> AgentState:
 
     return {
         **state,
-        "query_expanded": embed_query,
         "vector_hits": vector_hits,
         "bm25_hits": bm25_hits,
         "graph_hits": graph_hits,
