@@ -50,6 +50,12 @@ from ..tools.reranker import reranker
 
 logger = logging.getLogger(__name__)
 
+# ── Graceful degradation message when Ollama is unreachable ──────────────────
+_OLLAMA_UNAVAILABLE_MSG = (
+    "К сожалению, языковая модель временно недоступна. "
+    "Попробуйте повторить запрос через несколько минут."
+)
+
 
 def _score_stats(scores: list[float]) -> dict:
     """Return min/max/p50 for a list of scores. Returns empty dict if no scores."""
@@ -374,6 +380,9 @@ def _run_analysis_llm(
             *history,
             HumanMessage(content=user_msg),
         ])
+        if not raw.strip():
+            logger.error("analyze: LLM returned empty for task=%s (Ollama may be down)", task)
+            raw = _OLLAMA_UNAVAILABLE_MSG
         return raw, True
 
 

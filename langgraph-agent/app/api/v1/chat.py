@@ -247,7 +247,18 @@ async def chat(request: Request, req: ChatRequest) -> ChatResponse:
         )
     except Exception as exc:
         logger.exception("Graph execution failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return ChatResponse(
+            session_id=req.session_id,
+            intent="search",
+            intents=["search"],
+            response="К сожалению, произошла внутренняя ошибка. Попробуйте повторить запрос.",
+            citations=[],
+            export_path=None,
+            verify_result=None,
+            generate_result=None,
+            analyze_result=None,
+            retrieval_metrics={"degraded": True, "error": str(exc)},
+        )
 
     intent = result.get("intent", "search")
     return ChatResponse(

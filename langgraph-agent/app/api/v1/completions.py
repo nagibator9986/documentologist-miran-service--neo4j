@@ -243,7 +243,19 @@ async def chat_completions(
         )
     except Exception as exc:
         logger.exception("Graph error in completions (non-streaming)")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        error_msg = "К сожалению, произошла внутренняя ошибка. Попробуйте повторить запрос."
+        return JSONResponse({
+            "id": _make_id(),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": req.model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": error_msg},
+                "finish_reason": "error",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
 
     response_text = result.get("final_response", "")
     meta_str = _META_START + json.dumps(
