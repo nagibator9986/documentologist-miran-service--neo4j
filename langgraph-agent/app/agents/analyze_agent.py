@@ -73,15 +73,15 @@ def _score_stats(scores: list[float]) -> dict:
 TaskType = Literal["qa", "compare", "extract", "summary"]
 
 _COMPARE_STEMS = re.compile(
-    r"\b(?:сравн|сравнен|сопостав|отличи[ея]|разниц|различи[ея])\b",
+    r"(?:^|(?<=\s))(?:сравн|сравнен|сопостав|отличи[ея]|разниц|различи[ея])",
     re.IGNORECASE | re.UNICODE,
 )
 _EXTRACT_STEMS = re.compile(
-    r"\b(?:извлек|вытащ|выдел[иа]|найди\s+все|укажи\s+все|перечисл)\b",
+    r"(?:^|(?<=\s))(?:извлек|вытащ|выдел[иа]|найди\s+все|укажи\s+все|перечисл)",
     re.IGNORECASE | re.UNICODE,
 )
 _SUMMARY_STEMS = re.compile(
-    r"\b(?:резюм|суммар|суммаризу|кратк(?:о|ое|ий)|краткое\s+содержани)\b",
+    r"(?:^|(?<=\s))(?:резюм|суммар|суммаризу|кратк(?:о|ое|ий)|краткое\s+содержани)",
     re.IGNORECASE | re.UNICODE,
 )
 
