@@ -95,6 +95,13 @@ Plans:
 
 ## Phase 5: Production Hardening
 **Goal:** Система готова к деплою: тесты, CI, Docker prod конфиг.
+**Plans:** 3 plans
+**Requirements:** [FR-6, FR-7, NFR-1, NFR-2, NFR-3, NFR-4]
+
+Plans:
+- [ ] 05-01-PLAN.md — Integration test infrastructure + Ollama health check
+- [ ] 05-02-PLAN.md — .env.example completion + Makefile + docker-compose.prod.yml
+- [ ] 05-03-PLAN.md — Full test suite validation + v1.0 metrics documentation
 
 ### Tasks
 1. Написать `tests/integration/` — pytest suite: happy path для каждого агента (search, analyze qa, verify, generate, ingest)
