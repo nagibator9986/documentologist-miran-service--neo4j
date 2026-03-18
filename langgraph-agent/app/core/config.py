@@ -91,10 +91,11 @@ class Settings(BaseSettings):
     bm25_top_k: int = 40
     max_tokens_response: int = 2048
     temperature: float = 0.1
-    # Minimum cosine similarity score to consider a hit relevant (0–1).
-    # Hits below this threshold are discarded before LLM generation.
-    # Lowered to 0.35 for better recall; cross-encoder reranker handles precision
-    min_relevance_score: float = 0.35
+    # Minimum cosine similarity score to consider a hit relevant (0-1).
+    # Lowered from 0.35: gives cross-encoder more candidates in the normal path
+    # (not just the fallback path) for borderline-relevant chunks (cosine ~0.28-0.34).
+    # Calibrated 2026-03-17.
+    min_relevance_score: float = 0.25
     # Seconds before the entire LangGraph pipeline times out.
     # Prevents hanging requests when Ollama is unavailable.
     # Set to 240 to give generate agent (3 LLM passes) enough time.
@@ -120,8 +121,11 @@ class Settings(BaseSettings):
     reranker_max_content: int = 1024
 
     # ── Search pipeline tuning ────────────────────────────────────────
-    # Minimum sigmoid-normalised rerank score to consider context reliable
-    search_min_confidence: float = 0.25
+    # Minimum sigmoid-normalised rerank score to consider context reliable.
+    # Lowered from 0.25: cross-encoder sigmoid scores on Russian legal text often
+    # land 0.15-0.30 for genuinely relevant docs; original threshold was cutting
+    # too many borderline-relevant results. Calibrated 2026-03-17.
+    search_min_confidence: float = 0.15
     # Seconds before parallel graph-enrichment step times out
     graph_enrichment_timeout: float = 8.0
     # num_predict for supervisor intent LLM call (only need 1-2 words out)
