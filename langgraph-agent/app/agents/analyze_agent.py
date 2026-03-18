@@ -5,7 +5,6 @@ Pipeline (per request):
   2. _detect_task                — classify into qa / compare / extract / summary
   3. _enrich_search_query        — expand "этот документ" refs to real filenames
   4. _retrieve_and_rerank        — vector → BM25 → graph sections → cross-encoder
-     └─ _retrieve_compare_pair  — for compare: fetches two independent contexts
   5. _build_context_string       — assemble LLM-ready context with source headers
   6. _run_analysis_llm           — task-specific prompt + LLM call
      · compare / extract → JSON  (parse_with_retry + Pydantic schema, num_predict=2000)
@@ -260,32 +259,6 @@ def _extract_compare_subjects(query: str) -> tuple[str, str] | None:
     return None
 
 
-def _retrieve_compare_pair(
-    query: str,
-    s: Settings,
-) -> tuple[list[dict], list[dict], bool]:
-    """Fetch separate hit lists for the two sides of a comparison.
-
-    When subjects can be extracted, each side gets its own semantic search.
-    Falls back to a single unified search when extraction fails (returns the
-    unified list as side A with an empty side B).
-
-    Returns:
-        (hits_a, hits_b, used_pair_search)
-    """
-    subjects = _extract_compare_subjects(query)
-    if subjects:
-        subj_a, subj_b = subjects
-        logger.info("analyze compare: extracted pair (%r) vs (%r)", subj_a[:60], subj_b[:60])
-        hits_a = qdrant_search.invoke({"query": subj_a, "limit": s.analyze_compare_limit})
-        hits_b = qdrant_search.invoke({"query": subj_b, "limit": s.analyze_compare_limit})
-        return hits_a, hits_b, True
-
-    # Fallback: single search, split into two equal halves
-    hits = qdrant_search.invoke({"query": query, "limit": s.analyze_compare_limit * 2})
-    mid = len(hits) // 2 or len(hits)
-    return hits[:mid], hits[mid:], False
-
 
 # ── Stage 5: Context string assembly ──────────────────────────────────────────
 
@@ -533,11 +506,8 @@ def analyze_node(state: AgentState) -> AgentState:
     stage_counts: dict = {}
 
     if task == "compare":
-        # Fetch two independent hit-lists for the two sides
-        subjects = _extract_compare_subjects(query)
-        hits_a, hits_b, used_pair = _retrieve_compare_pair(query, s)
-
         # Rerank each side independently so the cross-encoder sees the right query
+        subjects = _extract_compare_subjects(query)
         query_a = subjects[0] if subjects else query
         query_b = subjects[1] if subjects else query
         reranked_a, score_a, ok_a, counts_a = _retrieve_and_rerank(query_a, query_a, s.analyze_compare_limit, s)
