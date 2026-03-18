@@ -2,12 +2,12 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: unknown
-stopped_at: Completed 05-01-PLAN.md
-last_updated: "2026-03-18T11:03:09Z"
+status: complete
+stopped_at: Completed 05-03-PLAN.md
+last_updated: "2026-03-18T11:08:40Z"
 progress:
   total_phases: 5
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 17
   completed_plans: 17
 ---
@@ -15,12 +15,12 @@ progress:
 # Project State
 
 ## Current Status
-**Phase:** Phase 5 — Production Hardening (In Progress, 2 of 3 plans done)
-**Milestone:** 1 — Production-Ready Agent System
+**Phase:** Phase 5 — Production Hardening (COMPLETE, 3 of 3 plans done)
+**Milestone:** 1 — Production-Ready Agent System (COMPLETE)
 **Date:** 2026-03-18
 
 ## Active Work
-Phase 5 in progress. Plan 01 (integration tests + Ollama health - complete), Plan 02 (env/docker/makefile hardening - complete), Plan 03 (pending).
+All phases complete. Milestone 1 achieved.
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
@@ -43,6 +43,7 @@ Phase 5 in progress. Plan 01 (integration tests + Ollama health - complete), Pla
 ## Completed
 - [x] Phase 5 Plan 01 — Integration tests + Ollama health check: 11 tests covering all 5 agents, conftest with TestClient + mock graph, /health/detailed Ollama check (commits: afa136c, 495356c, 60b5ad6)
 - [x] Phase 5 Plan 02 — Env/Docker/Makefile hardening: 68 Settings fields in .env.example, Makefile eval/prod targets, docker-compose.prod.yml overlay (commits: adb7b2a, 4498aa8)
+- [x] Phase 5 Plan 03 — METRICS-V1.md with v1.0 targets + Cyrillic regex fix in _detect_task, 38/38 tests green (commit: c6dc903)
 
 ## Key Decisions
 - **Removed query expansion entirely** — 7b model drops key legal terms, causing false negatives
@@ -80,6 +81,8 @@ Phase 5 in progress. Plan 01 (integration tests + Ollama health - complete), Pla
 - **Sync TestClient over async httpx.AsyncClient** — avoids event loop conflicts with pytest-asyncio
 - **Client fixture yields (client, mock_graph) tuple** — per-test graph.invoke override for intent-specific mocking
 - **Patch app.core.utils not app.main for health mocks** — health_detailed uses local import from .core.utils
+- **Replaced \\b with (?:^|(?<=\\s)) for Cyrillic regex** — Python re \\b broken for non-ASCII; stems are prefixes so no trailing boundary needed
+- **METRICS-V1.md Recorded Runs placeholder** — eval suite requires live stack; results to be filled post-deployment
 
 ## Critical Context
 - Код находится в: `documentologist-miran-service--neo4j/langgraph-agent/`
@@ -92,7 +95,7 @@ Phase 5 in progress. Plan 01 (integration tests + Ollama health - complete), Pla
 - Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Completed 05-01-PLAN.md
+Stopped at: Completed 05-03-PLAN.md
 
 ## Next Action
-Phase 5 Plans 01 and 02 complete. Remaining: Plan 03. Integration tests and production config ready.
+Milestone 1 complete. All 5 phases executed. System ready for live deployment and first eval run.
