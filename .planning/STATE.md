@@ -3,24 +3,24 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Phase 3 context gathered
-last_updated: "2026-03-17T17:59:03.103Z"
+stopped_at: Completed 03-02-PLAN.md
+last_updated: "2026-03-18T04:14:54.922Z"
 progress:
   total_phases: 5
   completed_phases: 2
-  total_plans: 7
-  completed_plans: 7
+  total_plans: 11
+  completed_plans: 8
 ---
 
 # Project State
 
 ## Current Status
-**Phase:** Phase 2 — JSON Reliability Fix (Plan 4 of 4 complete)
+**Phase:** Phase 3 — Retrieval Calibration (Plan 2 of 4 complete)
 **Milestone:** 1 — Production-Ready Agent System
-**Date:** 2026-03-17
+**Date:** 2026-03-18
 
 ## Active Work
-Phase 2 complete. All 4 plans done: 02-01 (json_output layer), 02-02 (anti-markdown prompts), 02-03 (verify/generate wiring), 02-04 (analyze_agent wiring).
+Phase 3 in progress. Plan 03-02 (score statistics) complete. Score distribution stats (min/max/p50) added to search_node metrics.
 
 ## Completed
 - [x] Project initialization (PROJECT.md, REQUIREMENTS.md, ROADMAP.md)
@@ -29,7 +29,12 @@ Phase 2 complete. All 4 plans done: 02-01 (json_output layer), 02-02 (anti-markd
 - [x] Phase 1 Plan 02 — Eval dataset (31 queries) + debug retrieval endpoint (commits: aab9bae, 779c2a7)
 - [x] Phase 1 Plan 03 — Agent metrics enrichment + eval runner script (commits: 13ffc3e, dff09eb)
 
+## Completed
+- [x] Phase 3 Plan 02 — Score statistics (min/max/p50) in search_node metrics (commit: 93d28cc)
+
 ## Key Decisions
+- **Used statistics.median for p50** — stdlib, no external dependency
+- **Empty score list returns {} not zeros** — clean metrics when stage has no hits
 - **No rewrite** — evolutionary improvement of existing agents
 - **Research skipped** — codebase already analyzed directly
 - **Phases ordered by impact:** JSON fix (P0) before retrieval (P1) before routing (P2)
@@ -54,7 +59,7 @@ Phase 2 complete. All 4 plans done: 02-01 (json_output layer), 02-02 (anti-markd
 - Eval runner: `tests/eval/run_eval.py` (routing_accuracy, json_validity_rate, retrieval_recall@5)
 
 ## Last Session
-Stopped at: Phase 3 context gathered
+Stopped at: Completed 03-02-PLAN.md
 
 ## Next Action
-Execute Phase 2 — JSON Reliability Fix (parse_with_retry, Pydantic schemas, prompt fixes).
+Execute remaining Phase 3 plans (03-01, 03-03, 03-04).
