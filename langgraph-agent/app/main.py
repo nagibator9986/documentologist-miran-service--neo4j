@@ -147,6 +147,15 @@ def create_app() -> FastAPI:
         except Exception as exc:
             checks["redis"] = f"error: {exc}"
 
+        # Ollama
+        try:
+            import httpx as _httpx
+            r = _httpx.get(f"{s.ollama_url}/api/tags", timeout=3)
+            r.raise_for_status()
+            checks["ollama"] = "ok"
+        except Exception as exc:
+            checks["ollama"] = f"error: {exc}"
+
         all_ok = all(v == "ok" for v in checks.values())
         return JSONResponse(
             {"status": "ok" if all_ok else "degraded", **checks},
