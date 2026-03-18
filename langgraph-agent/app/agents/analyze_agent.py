@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+import statistics as _statistics
 import time
 from typing import Literal
 
@@ -49,6 +50,18 @@ from ..tools.qdrant_search import qdrant_search
 from ..tools.reranker import reranker
 
 logger = logging.getLogger(__name__)
+
+
+def _score_stats(scores: list[float]) -> dict:
+    """Return min/max/p50 for a list of scores. Returns empty dict if no scores."""
+    if not scores:
+        return {}
+    return {
+        "min": round(min(scores), 4),
+        "max": round(max(scores), 4),
+        "p50": round(_statistics.median(scores), 4),
+    }
+
 
 # ── Task classification ────────────────────────────────────────────────────────
 
@@ -120,7 +133,7 @@ def _retrieve_and_rerank(
     lexical_query: str,
     limit: int,
     s: Settings,
-) -> tuple[list[dict], float, bool]:
+) -> tuple[list[dict], float, bool, dict]:
     """Hybrid retrieval pipeline for analyze: vector → BM25 → graph → rerank.
 
     Unlike the search agent this is deliberately synchronous (no thread pool)
@@ -128,7 +141,7 @@ def _retrieve_and_rerank(
     enrichment adds minimal extra latency compared to the total task time.
 
     Returns:
-        (reranked_docs, best_rerank_score, has_usable_context)
+        (reranked_docs, best_rerank_score, has_usable_context, stage_counts)
     """
     # 1. Vector search — broad semantic recall
     vector_hits: list[dict] = qdrant_search.invoke({
@@ -137,7 +150,7 @@ def _retrieve_and_rerank(
     })
 
     if not vector_hits:
-        return [], 0.0, False
+        return [], 0.0, False, {"vector_hits": 0, "bm25_hits": 0, "graph_hits": 0, "merged_hits": 0, "reranked_hits": 0, "rerank_score_stats": {}}
 
     # 2. BM25 over vector results — lifts lexically strong hits
     bm25_hits: list[dict] = bm25_search.invoke({
@@ -181,6 +194,16 @@ def _retrieve_and_rerank(
             seen_ids.add(hit_id)
         merged.append(hit)
 
+    # 4b. Cosine pre-filter (mirrors search_agent _filter_by_relevance)
+    filtered = [h for h in merged if h.get("score", 0) >= s.min_relevance_score]
+    if not filtered and merged:
+        logger.warning(
+            "analyze: all %d hits below min_relevance_score=%.2f -- using all",
+            len(merged), s.min_relevance_score,
+        )
+        filtered = merged
+    merged = filtered
+
     # 5. Cross-encoder rerank over candidate pool
     candidates = sorted(
         merged, key=lambda d: float(d.get("score", 0)), reverse=True
@@ -198,13 +221,21 @@ def _retrieve_and_rerank(
     best_score = reranked[0].get("rerank_score", 0.0) if reranked else 0.0
     has_context = bool(reranked) and best_score >= s.search_min_confidence
 
-    logger.debug(
+    logger.info(
         "analyze: retrieve_and_rerank hits=%d→bm25=%d→graph=%d→merged=%d "
         "→reranked=%d  best_score=%.3f",
         len(vector_hits), len(bm25_hits), len(graph_hits),
         len(merged), len(reranked), best_score,
     )
-    return reranked, best_score, has_context
+    stage_counts = {
+        "vector_hits": len(vector_hits),
+        "bm25_hits": len(bm25_hits),
+        "graph_hits": len(graph_hits),
+        "merged_hits": len(merged),
+        "reranked_hits": len(reranked),
+        "rerank_score_stats": _score_stats([h.get("rerank_score", 0) for h in reranked]),
+    }
+    return reranked, best_score, has_context, stage_counts
 
 
 # ── Stage 4b: Compare — fetch two independent contexts ────────────────────────
@@ -499,6 +530,7 @@ def analyze_node(state: AgentState) -> AgentState:
     has_context = False
     best_score = 0.0
     context_str = ""
+    stage_counts: dict = {}
 
     if task == "compare":
         # Fetch two independent hit-lists for the two sides
@@ -508,18 +540,34 @@ def analyze_node(state: AgentState) -> AgentState:
         # Rerank each side independently so the cross-encoder sees the right query
         query_a = subjects[0] if subjects else query
         query_b = subjects[1] if subjects else query
-        reranked_a, score_a, ok_a = _retrieve_and_rerank(query_a, query_a, s.analyze_compare_limit, s)
-        reranked_b, score_b, ok_b = _retrieve_and_rerank(query_b, query_b, s.analyze_compare_limit, s)
+        reranked_a, score_a, ok_a, counts_a = _retrieve_and_rerank(query_a, query_a, s.analyze_compare_limit, s)
+        reranked_b, score_b, ok_b, counts_b = _retrieve_and_rerank(query_b, query_b, s.analyze_compare_limit, s)
+
+        logger.info(
+            "analyze: compare side_a hits=%d best_score=%.3f | side_b hits=%d best_score=%.3f",
+            len(reranked_a), score_a, len(reranked_b), score_b,
+        )
 
         has_context = ok_a or ok_b
         best_score = max(score_a, score_b)
         all_hits = reranked_a + reranked_b
 
+        stage_counts = {
+            "vector_hits": counts_a.get("vector_hits", 0) + counts_b.get("vector_hits", 0),
+            "bm25_hits": counts_a.get("bm25_hits", 0) + counts_b.get("bm25_hits", 0),
+            "graph_hits": counts_a.get("graph_hits", 0) + counts_b.get("graph_hits", 0),
+            "merged_hits": counts_a.get("merged_hits", 0) + counts_b.get("merged_hits", 0),
+            "reranked_hits": counts_a.get("reranked_hits", 0) + counts_b.get("reranked_hits", 0),
+            "rerank_score_stats": _score_stats(
+                [h.get("rerank_score", 0) for h in reranked_a + reranked_b]
+            ),
+        }
+
         context_str = _build_compare_context(reranked_a, reranked_b, subjects, s)
 
     elif task == "summary":
         # Summary needs broad coverage — use a larger hit limit
-        reranked, best_score, has_context = _retrieve_and_rerank(
+        reranked, best_score, has_context, stage_counts = _retrieve_and_rerank(
             search_query, query, s.analyze_summary_limit, s
         )
         all_hits = reranked
@@ -527,7 +575,7 @@ def analyze_node(state: AgentState) -> AgentState:
 
     else:
         # qa / extract — standard retrieve
-        reranked, best_score, has_context = _retrieve_and_rerank(
+        reranked, best_score, has_context, stage_counts = _retrieve_and_rerank(
             search_query, query, s.rerank_top_k * 2, s
         )
         all_hits = reranked
