@@ -50,17 +50,24 @@ Plans:
 ---
 
 ## Phase 3: Retrieval Calibration
-**Goal:** Документы в базе находятся корректно; убрать false negatives.
+**Goal:** Документы в базе находятся корректно; убрать false negatives. Удалить query expansion, снизить пороги, привести analyze_agent к паритету с search_agent.
+**Plans:** 4 plans
+**Requirements:** [FR-2]
+
+Plans:
+- [ ] 03-01-PLAN.md — Remove query expansion + calibrate thresholds
+- [ ] 03-02-PLAN.md — Add score statistics to search_agent metrics
+- [ ] 03-03-PLAN.md — Analyze agent retrieval parity (pre-filter, INFO logging, metrics)
+- [ ] 03-04-PLAN.md — Eval dataset probing entries + recall validation
 
 ### Tasks
-1. Аудит cross-encoder нормализации в `app/tools/reranker.py` — проверить что sigmoid применяется правильно, добавить логирование raw scores vs normalized
-2. Снизить `search_min_confidence: 0.25 → 0.15` и `min_relevance_score: 0.35 → 0.25` как starting point; задокументировать в Settings комментарии почему выбраны значения
-3. Добавить per-stage retrieval logging в `search_agent.py` и `analyze_agent.py`: количество hits и score range на каждом этапе (exact / vector / BM25 / graph / after rerank)
-4. Добавить endpoint `POST /api/v1/debug/retrieval` — принимает `{query, collection}`, возвращает все stages без LLM
-5. Протестировать 10 "probing queries" через debug endpoint против документов в базе — убедиться что recall@5 ≥ 80%
-6. Зафиксировать финальные пороги в `config.py` с обоснованием
+1. Удалить `_expand_query` из `search_agent.py` и `SEARCH_EXPAND_QUERY` из промптов — подтверждённый источник false negatives
+2. Снизить `search_min_confidence: 0.25 -> 0.15` и `min_relevance_score: 0.35 -> 0.25` с rationale comments
+3. Добавить per-stage score statistics (min/max/p50) в search_agent metrics
+4. Привести analyze_agent к паритету: INFO logging, min_relevance_score pre-filter, retrieval_metrics, compare side logging
+5. Добавить 10 probing queries в eval dataset, проверить recall@5 >= 80%
 
-**UAT:** Для каждого из 5 тестовых документов в базе — прямой вопрос по их содержимому возвращает этот документ в top-3. Проверить через eval suite.
+**UAT:** Для каждого из 5 тестовых документов в базе — прямой вопрос по их содержимому возвращает этот документ в top-3. Проверить через eval suite: `retrieval_recall_at_5 >= 0.80`.
 
 ---
 
@@ -98,9 +105,9 @@ Plans:
 
 | Метрика | Цель |
 |---|---|
-| JSON parse success rate | ≥ 95% |
-| Supervisor routing accuracy | ≥ 90% |
-| Retrieval recall@5 (doc in base) | ≥ 80% |
+| JSON parse success rate | >= 95% |
+| Supervisor routing accuracy | >= 90% |
+| Retrieval recall@5 (doc in base) | >= 80% |
 | System crash on LLM timeout | 0 |
 | Integration tests passing | 100% |
-| `make test` passes from scratch | ✓ |
+| `make test` passes from scratch | v |
