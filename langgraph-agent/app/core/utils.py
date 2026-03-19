@@ -27,6 +27,67 @@ DOC_REF_RE = re.compile(
 # Matches common document filenames (pdf, docx, doc, txt, json)
 FILENAME_RE = re.compile(r"[\w\-]+\.(?:pdf|docx|doc|txt|json)\b", re.IGNORECASE)
 
+# Common conversational prefixes to strip before classification / retrieval.
+_CONVERSATIONAL_PREFIXES_RE = re.compile(
+    r"^(?:(?:скажите?\s+)?пожалуйста\s*,?\s*"
+    r"|(?:привет|здравствуйте?|добрый\s+(?:день|вечер|утро))\s*[!,.]?\s*"
+    r"|подскажи(?:те)?\s*,?\s*"
+    r"|не\s+мог(?:ли|бы)\s+(?:бы\s+)?(?:вы\s+)?(?:мне\s+)?"
+    r"|будьте?\s+добры?\s*,?\s*"
+    r"|можно\s+(?:ли\s+)?(?:узнать|спросить)\s*,?\s*"
+    r")+",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def strip_conversational_prefix(query: str) -> str:
+    """Remove polite/greeting prefixes so downstream classifiers see only the core query."""
+    stripped = _CONVERSATIONAL_PREFIXES_RE.sub("", query).strip()
+    return stripped if stripped else query
+
+
+# ---------------------------------------------------------------------------
+# Hit metadata helpers
+# ---------------------------------------------------------------------------
+
+
+def extract_hit_filename(hit: dict[str, Any]) -> str | None:
+    """Extract the source filename from a retrieval hit dict.
+
+    Looks in several locations: top-level ``filename``, ``section`` field,
+    and nested ``metadata.source`` / ``metadata.filename``.
+    """
+    # Direct field
+    fn = hit.get("filename")
+    if fn:
+        return fn
+    # metadata.source or metadata.filename
+    meta = hit.get("metadata") or {}
+    fn = meta.get("source") or meta.get("filename")
+    if fn:
+        return fn
+    # Fallback: extract from section string like "стр. 5 — doc.pdf"
+    section = hit.get("section", "")
+    if section:
+        m = FILENAME_RE.search(section)
+        if m:
+            return m.group(0)
+    return None
+
+
+def extract_hit_page(hit: dict[str, Any]) -> int | str | None:
+    """Extract the page number from a retrieval hit dict."""
+    meta = hit.get("metadata") or {}
+    page = meta.get("page_number") or meta.get("page")
+    if page is not None:
+        return page
+    # Try parsing from section string "стр. 12"
+    section = hit.get("section", "")
+    m = re.search(r"стр\.?\s*(\d+)", section)
+    if m:
+        return int(m.group(1))
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Conversation history helper
@@ -239,7 +300,7 @@ def get_neo4j_driver():
 
 
 def close_all_clients() -> None:
-    """Close all singleton DB clients. Called on application shutdown."""
+    """Close all singleton DB clients and thread pools. Called on application shutdown."""
     global _qdrant_client, _neo4j_driver
 
     with _qdrant_lock:
@@ -261,6 +322,16 @@ def close_all_clients() -> None:
                 logger.warning("Error closing Neo4j driver: %s", exc)
             finally:
                 _neo4j_driver = None
+
+    # Shutdown the graph query thread pool from retrieval module
+    try:
+        from ..tools.retrieval import _graph_pool, _graph_pool_lock
+        with _graph_pool_lock:
+            if _graph_pool is not None:
+                _graph_pool.shutdown(wait=False)
+                logger.info("Graph query thread pool shut down.")
+    except Exception as exc:
+        logger.warning("Error shutting down graph pool: %s", exc)
 
 
 # ---------------------------------------------------------------------------

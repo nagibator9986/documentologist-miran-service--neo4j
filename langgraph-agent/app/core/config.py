@@ -116,16 +116,18 @@ class Settings(BaseSettings):
     reranker_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     # Fallback cross-encoder if primary fails to load
     reranker_fallback_model: str = "cross-encoder/ms-marco-MiniLM-L6-v2"
-    # Max characters of content fed to the cross-encoder per chunk
-    # 1024 chars ≈ 200-250 tokens; legal paragraphs often need full context
-    reranker_max_content: int = 1024
+    # Max characters of content fed to the cross-encoder per chunk.
+    # bank_knowledge chunks are 1200 chars (default) or up to 2000 (if overridden).
+    # 1500 chars ≈ 300-400 RU tokens — fits within cross-encoder max_length=512 tokens
+    # while covering the full default chunk.  Previous value (1024) cut 15% of content.
+    reranker_max_content: int = 1500
 
     # ── Search pipeline tuning ────────────────────────────────────────
     # Minimum sigmoid-normalised rerank score to consider context reliable.
-    # Lowered from 0.25: cross-encoder sigmoid scores on Russian legal text often
-    # land 0.15-0.30 for genuinely relevant docs; original threshold was cutting
-    # too many borderline-relevant results. Calibrated 2026-03-17.
-    search_min_confidence: float = 0.15
+    # Raised from 0.15: previous threshold let nearly everything through (sigmoid
+    # 0.15 = logit -1.7).  0.35 genuinely filters low-relevance chunks while
+    # keeping borderline-relevant legal text.
+    search_min_confidence: float = 0.35
     # Seconds before parallel graph-enrichment step times out
     graph_enrichment_timeout: float = 8.0
     # num_predict for supervisor intent LLM call (only need 1-2 words out)
@@ -134,8 +136,13 @@ class Settings(BaseSettings):
     verify_pasted_doc_threshold: int = 300
 
     # ── Qdrant vector schema ──────────────────────────────────────────
-    # Named vector used in dual-vector Qdrant collections (set by the indexer)
-    qdrant_named_vector: str = "q_vec"
+    # Named vector used for retrieval queries in dual-vector Qdrant collections.
+    # bank_knowledge creates two vectors per chunk:
+    #   q_vec  — embedding of the question/title (short text)
+    #   qa_vec — embedding of full context (product + section + answer + question)
+    # qa_vec is preferred for retrieval because it captures the full chunk content,
+    # while q_vec only has a short snippet.  Falls back to q_vec if qa_vec unavailable.
+    qdrant_named_vector: str = "qa_vec"
 
     # ── Neo4j index names ─────────────────────────────────────────────
     # Fulltext index on Section.text_preview (created at startup)
@@ -166,18 +173,25 @@ class Settings(BaseSettings):
     sse_word_chunk_size: int = 6
 
     # ── Reranking ─────────────────────────────────────────────────────
-    # Hard candidate pool fed to the cross-encoder before top_k selection.
-    # Replaces the old rerank_top_k * 2 magic: 30 covers all merged hits
-    # (vector 40 + BM25 40 + graph ~10, deduplicated to ~45) without waste.
-    rerank_candidate_pool: int = 30
-    # Kept for any external callers that still reference this setting.
-    rerank_candidate_multiplier: int = 2
+    # Cross-encoder processes ALL merged candidates (no cosine pre-filter).
+    # The old rerank_candidate_pool=30 dropped corpus BM25 / graph hits with
+    # low cosine but high actual relevance.  50 forward passes on a 33M-param
+    # model adds ~70ms — negligible compared to LLM latency.
+    rerank_candidate_pool: int = 50
 
-    # ── Analyze agent ─────────────────────────────────────────────────
-    # Number of Qdrant hits for summary tasks (needs broad coverage).
-    analyze_summary_limit: int = 15
-    # Number of Qdrant hits per document side in compare tasks.
-    analyze_compare_limit: int = 8
+    # ── Scoped retrieval ─────────────────────────────────────────────
+    # Max chunks returned by cross-encoder in SCOPED mode (single document).
+    scoped_rerank_top_k: int = 20
+    # Documents with <= this many chunks are passed to LLM in full (no rerank).
+    scoped_small_doc_threshold: int = 25
+
+    # ── Map-Reduce (document scope) ──────────────────────────────────
+    # Chunks per LLM batch in the MAP phase.
+    map_reduce_batch_size: int = 8
+    # num_predict for each MAP call (short intermediate summary).
+    map_reduce_map_num_predict: int = 512
+    # num_predict for the final REDUCE call.
+    map_reduce_reduce_num_predict: int = 2048
 
     # ── Memory agent ───────────────────────────────────────────────────
     # How many messages to load from Redis into state["messages"] at the

@@ -145,14 +145,39 @@ def scroll_all_chunks(
     return all_chunks
 
 
+def _build_doc_id_filter(doc_id: str) -> Any:
+    """Build a Qdrant filter that matches chunks by doc_id.
+
+    bank_knowledge stores meta_json as a **dict** in Qdrant payload, so we
+    use the nested field path ``meta_json.doc_id`` with ``MatchValue`` for
+    exact matching.  Falls back to ``MatchText`` on the raw ``meta_json``
+    field for legacy collections where meta_json is a JSON string.
+
+    The two conditions are combined with ``should`` (OR) so both formats work.
+    """
+    from qdrant_client import models as qmodels
+
+    return qmodels.Filter(
+        should=[
+            # Primary: meta_json is a dict → nested field access
+            qmodels.FieldCondition(
+                key="meta_json.doc_id",
+                match=qmodels.MatchValue(value=doc_id),
+            ),
+            # Fallback: meta_json is a JSON string → substring match
+            qmodels.FieldCondition(
+                key="meta_json",
+                match=qmodels.MatchText(text=doc_id),
+            ),
+        ]
+    )
+
+
 def qdrant_scroll_by_doc_ids(
     doc_ids: list[str],
     max_chunks_per_doc: int = 10,
 ) -> list[str]:
-    """Fetch text chunks from Qdrant filtered by doc_id values in meta_json.
-
-    Keeps qdrant_client.models inside the tool layer so callers (agents)
-    don't need to import infrastructure types directly.
+    """Fetch text chunks from Qdrant filtered by doc_id in meta_json.
 
     Args:
         doc_ids: Document identifiers to filter on (up to 3 used).
@@ -161,8 +186,6 @@ def qdrant_scroll_by_doc_ids(
     Returns:
         List of text strings (content snippets) for all matching chunks.
     """
-    from qdrant_client import models as qmodels
-
     s = get_settings()
     client = get_qdrant_client()
     chunks: list[str] = []
@@ -171,12 +194,7 @@ def qdrant_scroll_by_doc_ids(
         try:
             records, _ = client.scroll(
                 collection_name=s.qdrant_collection,
-                scroll_filter=qmodels.Filter(
-                    must=[qmodels.FieldCondition(
-                        key="meta_json",
-                        match=qmodels.MatchText(text=doc_id),
-                    )]
-                ),
+                scroll_filter=_build_doc_id_filter(doc_id),
                 limit=max_chunks_per_doc,
                 with_payload=True,
                 with_vectors=False,
@@ -191,6 +209,81 @@ def qdrant_scroll_by_doc_ids(
 
     logger.debug("qdrant_scroll_by_doc_ids(%s) → %d chunks", doc_ids, len(chunks))
     return chunks
+
+
+def scroll_all_by_doc_id(
+    doc_id: str,
+    collection: str = "",
+    max_chunks: int = 2000,
+) -> list[dict[str, Any]]:
+    """Fetch ALL chunks belonging to a single document.
+
+    Paginates through the full document and returns structured hit dicts
+    compatible with the retrieval pipeline.
+
+    Used by SCOPED and DOCUMENT retrieval strategies.
+
+    Note: bank_knowledge stores ``meta_json`` as a dict in Qdrant payload.
+    The filter uses ``meta_json.doc_id`` with ``MatchValue`` for exact
+    matching, with a ``MatchText`` fallback for legacy string-format payloads.
+
+    Args:
+        doc_id: Document identifier stored in ``payload.meta_json.doc_id``.
+        collection: Qdrant collection name (uses default if empty).
+        max_chunks: Safety cap to prevent OOM on pathological documents.
+
+    Returns:
+        List of hit dicts with id, content, question, section, metadata, score.
+    """
+    s = get_settings()
+    col = collection or s.qdrant_collection
+    client = get_qdrant_client()
+
+    all_hits: list[dict[str, Any]] = []
+    offset = None
+    _BATCH = 500
+
+    scroll_filter = _build_doc_id_filter(doc_id)
+
+    while len(all_hits) < max_chunks:
+        try:
+            records, next_offset = client.scroll(
+                collection_name=col,
+                scroll_filter=scroll_filter,
+                limit=_BATCH,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "scroll_all_by_doc_id(%r): scroll failed at offset=%s: %s",
+                doc_id, offset, exc,
+            )
+            break
+
+        for r in records:
+            payload = r.payload or {}
+            content = payload.get("answer") or payload.get("text", "")
+            if content:
+                all_hits.append({
+                    "id": str(r.id),
+                    "content": content,
+                    "question": payload.get("question", ""),
+                    "section": payload.get("section_title", ""),
+                    "metadata": payload,
+                    "score": 0.0,
+                })
+
+        if not records or next_offset is None or len(records) < _BATCH:
+            break
+        offset = next_offset
+
+    logger.info(
+        "scroll_all_by_doc_id(%r): loaded %d chunks from '%s'",
+        doc_id, len(all_hits), col,
+    )
+    return all_hits
 
 
 @tool

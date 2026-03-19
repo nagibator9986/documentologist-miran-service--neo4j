@@ -55,33 +55,48 @@ class SuryaOCRService:
             logger.error(f"  ✗ RecognitionPredictor: {e}")
             self.rec_predictor = None
 
-        # --- ЗАКОММЕНТИРОВАНО ДЛЯ ЭКОНОМИИ RAM ---
+        # Layout and Table predictors are optional — disabled by default to save
+        # ~1.5 GB RAM.  Enable via OCR_ENABLE_LAYOUT=true / OCR_ENABLE_TABLE=true.
+        # Useful for documents with multi-column layouts or complex tables.
         self.layout_predictor = None
-        # try:
-        #     from surya.layout import LayoutPredictor
-        #     self.layout_predictor = LayoutPredictor(device="cpu")
-        #     logger.info("  ✓ LayoutPredictor")
-        # except Exception as e:
-        #     self.layout_predictor = None
+        if os.getenv("OCR_ENABLE_LAYOUT", "false").lower() == "true":
+            try:
+                from surya.layout import LayoutPredictor
+                self.layout_predictor = LayoutPredictor(device="cpu")
+                logger.info("  ✓ LayoutPredictor (enabled via OCR_ENABLE_LAYOUT)")
+            except Exception as e:
+                logger.warning("  ✗ LayoutPredictor: %s", e)
+        else:
+            logger.info("  ⊘ LayoutPredictor skipped (OCR_ENABLE_LAYOUT=false)")
 
         self.table_predictor = None
-        # try:
-        #     from surya.table_rec import TableRecPredictor
-        #     self.table_predictor = TableRecPredictor(device="cpu")
-        #     logger.info("  ✓ TableRecPredictor")
-        # except Exception as e:
-        #     self.table_predictor = None
+        if os.getenv("OCR_ENABLE_TABLE", "false").lower() == "true":
+            try:
+                from surya.table_rec import TableRecPredictor
+                self.table_predictor = TableRecPredictor(device="cpu")
+                logger.info("  ✓ TableRecPredictor (enabled via OCR_ENABLE_TABLE)")
+            except Exception as e:
+                logger.warning("  ✗ TableRecPredictor: %s", e)
+        else:
+            logger.info("  ⊘ TableRecPredictor skipped (OCR_ENABLE_TABLE=false)")
 
-        logger.info("✅ Surya models ready (OCR Only).")
+        mode = "Full" if (self.layout_predictor or self.table_predictor) else "OCR Only"
+        logger.info("✅ Surya models ready (%s).", mode)
 
     @staticmethod
-    def _iter_pdf_images(pdf_bytes: bytes, dpi: int = 120) -> Iterator["Image.Image"]:
+    def _iter_pdf_images(pdf_bytes: bytes, dpi: int | None = None) -> Iterator["Image.Image"]:
         """Yield one PIL Image per PDF page, releasing each pixmap immediately.
 
         Using a generator instead of building a full list keeps peak memory
         proportional to a single page rather than the entire document.
-        DPI=120 reduces memory 3–4× vs DPI=200.
+
+        DPI is configurable via ``OCR_PDF_DPI`` env var (default: 150).
+        Higher DPI improves accuracy on small text/tables at the cost of memory.
         """
+        import os
+        if dpi is None:
+            raw_dpi = int(os.getenv("OCR_PDF_DPI", "150"))
+            dpi = max(72, min(600, raw_dpi))  # clamp to safe range
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         zoom = dpi / 72
         mat = fitz.Matrix(zoom, zoom)

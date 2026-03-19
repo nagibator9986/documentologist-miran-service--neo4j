@@ -1,29 +1,29 @@
 """Search Agent — hybrid RAG pipeline orchestrator.
 
-Pipeline stages (each is a focused private function):
+Refactored to use the unified retrieval module. The search agent is now a
+thin orchestration layer:
   1. _prepare_query       — referential enrichment
   2. _detect_exact_search — quoted / prefix-based exact match detection
   3. _retrieve_exact      — Qdrant MatchText search for literal strings
-  4. _retrieve_vector_bm25 — vector search + BM25 lexical reranking + merge
-  5. _retrieve_graph      — parallel Neo4j enrichment (sections, articles,
-                             obligations, entities, laws)
-  6. _normalize_graph_hits — convert raw graph records to unified hit dicts
-  7. _merge_all_hits      — combine all hit sources, deduplicating by ID
-  8. _filter_by_relevance — drop low-cosine hits, fall back to all if empty
-  9. _rerank_and_calibrate — cross-encoder reranking + confidence threshold
- 10. _build_llm_prompt    — assemble context string for the LLM call
- 11. _generate_answer     — LLM generation with history
- 12. _build_citations     — format structured citation list
- 13. search_node          — orchestrator: wires the pipeline, returns state
+  4. retrieve()           — unified retrieval (point / scoped / document)
+  5. _build_llm_prompt    — assemble context string for the LLM call
+  6. _generate_answer     — LLM generation with history
+  7. _build_citations     — format structured citation list
+  8. search_node          — orchestrator: wires the pipeline, returns state
+
+Key changes:
+  - Retrieval logic moved to ``app.tools.retrieval`` (Single Responsibility).
+  - BM25-over-vector-hits removed (returned same IDs; cross-encoder re-sorts).
+  - Cosine pre-filter before cross-encoder removed (incomparable score scales).
+  - Supports SCOPED mode: search within a single document (top-20 instead of top-7).
+  - Hallucination guard simplified: better context = fewer hallucinations.
 """
 from __future__ import annotations
 
 import logging
 import re
 import statistics as _statistics
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
@@ -40,19 +40,12 @@ from ..core.utils import (
 )
 from ..graph.state import AgentState
 from ..prompts import SEARCH_EXPERT
-from ..tools.bm25_search import bm25_search, corpus_bm25_search
-from ..tools.neo4j_query import (
-    graph_entity_lookup,
-    graph_obligation_search,
-    graph_section_search,
-    neo4j_query,
-)
-from ..tools.qdrant_search import qdrant_search, qdrant_text_search
-from ..tools.reranker import reranker
+from ..tools.qdrant_search import qdrant_text_search
+from ..tools.retrieval import retrieve
 
 logger = logging.getLogger(__name__)
 
-# ── Hallucination guard: LLM sometimes claims "no info" despite having context ─
+# ── Hallucination guard ──────────────────────────────────────────────────────
 _HALLUCINATION_STUBS = re.compile(
     r"(?:у меня нет (?:информации|данных)"
     r"|не располагаю информацией"
@@ -63,55 +56,13 @@ _HALLUCINATION_STUBS = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
-# ── Graceful degradation message when Ollama is unreachable ──────────────────
 _OLLAMA_UNAVAILABLE_MSG = (
     "К сожалению, языковая модель временно недоступна. "
     "Найденные документы доступны в цитатах ниже. "
     "Попробуйте повторить запрос через несколько минут."
 )
 
-# ── Module-level thread pool for parallel Neo4j queries ──────────────────────
-# Lazy singleton with double-checked locking — created once, reused per request.
-# Prevents unbounded thread creation when many requests arrive simultaneously.
-
-_graph_pool: ThreadPoolExecutor | None = None
-_graph_pool_lock = threading.Lock()
-
-
-def _get_graph_pool() -> ThreadPoolExecutor:
-    global _graph_pool
-    if _graph_pool is None:
-        with _graph_pool_lock:
-            if _graph_pool is None:
-                _graph_pool = ThreadPoolExecutor(
-                    max_workers=get_settings().graph_pool_workers,
-                    thread_name_prefix="graph-query",
-                )
-    return _graph_pool
-
-
-# ── Domain-specific regex patterns ───────────────────────────────────────────
-
-_ARTICLE_NUM_RE = re.compile(r"[Сс]тать[яей]\s+(\d+)", re.UNICODE)
-
-_ENTITY_ORG_RE = re.compile(
-    r'\b(ТОО|АО|НАО|ОАО|ЗАО|ГП|ЧП|МФО|БВУ|Kaspi|Halyk|БТА|Цесна|Jusan|Нурбанк|Евразийский|Bereke)\b',
-    re.UNICODE,
-)
-_CAPS_SEQUENCE_RE = re.compile(
-    r'\b[А-ЯЁ][а-яё]{2,}(?:\s+[А-ЯЁ][а-яё]{2,}){1,}\b',
-    re.UNICODE,
-)
-_LAW_QUERY_RE = re.compile(
-    r'(?:Закон\s+(?:РК|Республики\s+Казахстан)\s+о[б]?\s+[а-яёА-ЯЁ][а-яё\s,]{4,50}'
-    r'|(?:Гражданский|Налоговый|Трудовой|Уголовный)\s+кодекс'
-    r'|(?:ГК|НК|ТК|КоАП|УК)\s+(?:РК|Республики\s+Казахстан))',
-    re.IGNORECASE | re.UNICODE,
-)
-_OBL_KEYWORDS = frozenset([
-    "обяза", "должен", "обязан", "ответствен", "вправе", "право ",
-    "запрещ", "недопустим", "обязательств",
-])
+# ── Exact search patterns ────────────────────────────────────────────────────
 _QUOTED_TEXT_RE = re.compile(
     r'["\u00ab\u201c\u2018](.{8,}?)["\u00bb\u201d\u2019]', re.UNICODE | re.DOTALL
 )
@@ -131,27 +82,11 @@ _EXACT_SEARCH_PREFIXES: tuple[str, ...] = (
     "найди точный ", "найди дословно ", "есть ли строка ", "содержит строку ",
     "в каком документе ", "в каком файле ",
 )
-_RU_STOPWORDS = frozenset([
-    "и", "в", "на", "по", "с", "к", "о", "об", "из", "от", "до", "для",
-    "что", "как", "это", "все", "при", "или", "но", "не", "да", "же",
-    "а", "то", "так", "где", "когда", "если", "чтобы", "кто", "который",
-    "мне", "мы", "вы", "он", "она", "они", "его", "её", "их", "этот",
-    "эта", "эти", "того", "тот", "за", "со", "во", "без", "под", "над",
-])
-
-# ── Small data helpers ────────────────────────────────────────────────────────
-
-def _extract_graph_keywords(query: str, max_words: int) -> str:
-    """Return significant words from query for Neo4j keyword search."""
-    words = re.findall(r"[а-яёА-ЯЁa-zA-Z0-9]+", query)
-    significant = [w for w in words if w.lower() not in _RU_STOPWORDS and len(w) >= 3]
-    return " ".join(significant[:max_words])
 
 
-# ── Score statistics helper ────────────────────────────────────────────────────
+# ── Score statistics helper ──────────────────────────────────────────────────
 
 def _score_stats(scores: list[float]) -> dict:
-    """Return min/max/p50 for a list of scores. Returns empty dict if no scores."""
     if not scores:
         return {}
     return {
@@ -161,37 +96,29 @@ def _score_stats(scores: list[float]) -> dict:
     }
 
 
-# ── Stage 1: Query preparation ────────────────────────────────────────────────
+# ── Stage 1: Query preparation ──────────────────────────────────────────────
 
-def _prepare_query(query: str, state: AgentState) -> tuple[str, str]:
-    """Enrich referential queries. Returns (query, query) — both lexical and embed use the same original query."""
+def _prepare_query(query: str, state: AgentState) -> str:
+    """Strip conversational prefix and enrich referential queries."""
     query = strip_conversational_prefix(query)
     if DOC_REF_RE.search(query):
         filename = extract_recent_filename(state)
         if filename:
             query = f"{filename} {query}"
             logger.info("search: referential query enriched with filename=%s", filename)
-    return query, query
+    return query
 
 
-# ── Stage 2: Exact-string search detection ────────────────────────────────────
+# ── Stage 2-3: Exact-string search ──────────────────────────────────────────
 
 def _detect_exact_search(query: str) -> tuple[bool, str]:
-    """Determine whether the query requests a literal substring match.
-
-    Returns:
-        (is_exact, exact_text) — exact_text is the string to search for.
-    """
     query_lower = query.lower()
     quoted = _QUOTED_TEXT_RE.search(query)
     is_exact = bool(quoted or any(kw in query_lower for kw in _EXACT_SEARCH_KW))
-
     if not is_exact:
         return False, ""
-
     if quoted:
         return True, quoted.group(1).strip()
-
     search_text = query
     for prefix in _EXACT_SEARCH_PREFIXES:
         if query_lower.startswith(prefix):
@@ -200,10 +127,7 @@ def _detect_exact_search(query: str) -> tuple[bool, str]:
     return True, search_text
 
 
-# ── Stage 3: Exact Qdrant text search ────────────────────────────────────────
-
 def _retrieve_exact(exact_text: str, s: Settings) -> list[dict]:
-    """Run Qdrant server-side MatchText search. Non-fatal."""
     if not exact_text:
         return []
     try:
@@ -219,283 +143,7 @@ def _retrieve_exact(exact_text: str, s: Settings) -> list[dict]:
         return []
 
 
-# ── Stage 4: Vector + BM25 retrieval ─────────────────────────────────────────
-
-def _retrieve_vector_bm25(
-    embed_query: str, lexical_query: str, s: Settings
-) -> tuple[list[dict], list[dict], list[dict]]:
-    """Vector search + BM25 rerank over its results + full-corpus BM25.
-
-    Full-corpus BM25 catches documents that vector search misses (e.g. exact
-    article numbers, law names, KZT amounts with low semantic similarity).
-
-    Returns:
-        (vector_hits, bm25_hits, corpus_bm25_hits)
-    """
-    vector_hits = qdrant_search.invoke({
-        "query": embed_query,
-        "collection": s.qdrant_collection,
-        "limit": s.qdrant_top_k,
-    })
-    bm25_hits = bm25_search.invoke({
-        "query": lexical_query,
-        "documents": vector_hits,
-        "top_k": s.bm25_top_k,
-    })
-    corpus_hits = corpus_bm25_search(
-        query=lexical_query,
-        top_k=s.bm25_top_k,
-        collection=s.qdrant_collection,
-    )
-    return vector_hits, bm25_hits, corpus_hits
-
-
-# ── Stage 5: Parallel Neo4j graph enrichment ─────────────────────────────────
-
-def _retrieve_graph(query: str, s: Settings) -> dict[str, list[dict]]:
-    """Run 5 graph queries in parallel with a timeout.
-
-    Returns dict with keys: sections, articles, obligations, entities, laws.
-    Any individual query failure is non-fatal (returns empty list for that key).
-    """
-    kw = _extract_graph_keywords(query, s.graph_kw_max_words)
-    art_match = _ARTICLE_NUM_RE.search(query)
-    needs_obligations = any(ob_kw in query.lower() for ob_kw in _OBL_KEYWORDS)
-    needs_entities = bool(_ENTITY_ORG_RE.search(query) or _CAPS_SEQUENCE_RE.search(query))
-    law_match = _LAW_QUERY_RE.search(query)
-
-    def _sections() -> list[dict]:
-        return graph_section_search.invoke({"keywords": kw, "limit": 4})
-
-    def _articles() -> list[dict]:
-        if not art_match:
-            return []
-        return neo4j_query.invoke({
-            "cypher": (
-                "MATCH (a:Article {number: $num})<-[:HAS_ARTICLE]-(s:Section)"
-                "<-[:CONTAINS]-(d:Document) "
-                "RETURN a.number AS number, a.title AS title, "
-                "s.text_preview AS text, d.filename AS source LIMIT 3"
-            ),
-            "params": {"num": int(art_match.group(1))},
-        })
-
-    def _obligations() -> list[dict]:
-        if not needs_obligations:
-            return []
-        return graph_obligation_search.invoke({"keywords": kw, "limit": 3})
-
-    def _entities() -> list[dict]:
-        if not needs_entities:
-            return []
-        return graph_entity_lookup.invoke({"text": kw[:60], "limit": 4})
-
-    def _laws() -> list[dict]:
-        if not law_match:
-            return []
-        return neo4j_query.invoke({
-            "cypher": (
-                "MATCH (l:Law) "
-                "WHERE toLower(l.title) CONTAINS toLower($kw) "
-                "OPTIONAL MATCH (l)-[:HAS_ARTICLE]->(a:Article) "
-                "RETURN l.law_id AS law_id, l.title AS title, "
-                "collect({number: a.number, title: a.title}) AS articles LIMIT 3"
-            ),
-            "params": {"kw": law_match.group(0)[:80]},
-        })
-
-    results: dict[str, list[dict]] = {
-        k: [] for k in ("sections", "articles", "obligations", "entities", "laws")
-    }
-    task_map = {
-        "sections": _sections,
-        "articles": _articles,
-        "obligations": _obligations,
-        "entities": _entities,
-        "laws": _laws,
-    }
-
-    pool = _get_graph_pool()
-    futures = {pool.submit(fn): name for name, fn in task_map.items()}
-    try:
-        for future in as_completed(futures, timeout=s.graph_enrichment_timeout):
-            name = futures[future]
-            try:
-                results[name] = future.result()
-            except Exception as exc:
-                logger.warning("graph_%s lookup failed: %s", name, exc)
-    except TimeoutError:
-        logger.warning(
-            "search: graph enrichment timeout (%.1fs) — using partial results",
-            s.graph_enrichment_timeout,
-        )
-
-    return results
-
-
-# ── Stage 6: Normalize graph records to unified hit format ───────────────────
-
-def _normalize_graph_hits(graph_results: dict[str, list[dict]], s: Settings) -> list[dict]:
-    """Convert raw Neo4j records to the same dict shape as Qdrant hits."""
-    hits: list[dict] = []
-
-    for sec in graph_results.get("sections", []):
-        text = sec.get("text") or ""
-        if text:
-            hits.append({
-                "id": sec.get("section_id", ""),
-                "content": text[:s.content_snippet_max_len],
-                "score": float(sec.get("score", 0.0)),
-                "section": f"стр. {sec.get('page', '?')} — {sec.get('source', '')}",
-                "metadata": {"articles": sec.get("articles", [])},
-            })
-
-    for rec in graph_results.get("articles", []):
-        if rec.get("text"):
-            art_num = rec.get("number", "?")
-            title_part = f": {rec['title']}" if rec.get("title") else ""
-            hits.append({
-                "id": f"article:{art_num}:{rec.get('source', '')}",
-                "content": f"Статья {art_num}{title_part}\n{rec['text'][:s.content_snippet_max_len]}",
-                "score": 1.0,
-                "section": rec.get("source", ""),
-                "metadata": {"article_number": art_num, "article_title": rec.get("title", "")},
-            })
-
-    for rec in graph_results.get("obligations", []):
-        content = " — ".join(
-            p for p in [rec.get("subject"), rec.get("action"), rec.get("object")] if p
-        )
-        if rec.get("evidence"):
-            content += f"\n{rec['evidence']}"
-        hits.append({
-            "id": f"obl:{rec.get('doc_id', '')}:{hash(content)}",
-            "content": content[:s.content_snippet_max_len],
-            "score": float(rec.get("confidence", 0.7)),
-            "section": rec.get("document", ""),
-            "metadata": {"type": "obligation", "deadline": rec.get("deadline", "")},
-        })
-
-    for rec in graph_results.get("entities", []):
-        ent_text = rec.get("text", "")
-        if not ent_text:
-            continue
-        ent_label = rec.get("label", "")
-        content_parts = [f"{ent_label}: {ent_text}"]
-        if rec.get("role"):
-            content_parts.append(f"Роль: {rec['role']}")
-        if rec.get("evidence"):
-            content_parts.append(rec["evidence"])
-        docs = rec.get("documents") or []
-        hits.append({
-            "id": f"ent:{ent_label}:{ent_text}",
-            "content": "\n".join(content_parts)[:s.content_snippet_max_len],
-            "score": float(rec.get("confidence", 0.6)),
-            "section": ", ".join(docs[:2]) if docs else "",
-            "metadata": {"type": "entity", "entity_label": ent_label, "entity_text": ent_text},
-        })
-
-    for rec in graph_results.get("laws", []):
-        law_title = rec.get("title", "")
-        if not law_title:
-            continue
-        articles = rec.get("articles") or []
-        art_list = ", ".join(
-            f"ст.{a.get('number', '')}{': ' + a['title'] if a.get('title') else ''}"
-            for a in articles[:10] if a.get("number")
-        )
-        content = f"Закон: {law_title}"
-        if art_list:
-            content += f"\nСтатьи: {art_list}"
-        hits.append({
-            "id": f"law:{rec.get('law_id', law_title)}",
-            "content": content[:s.content_snippet_max_len],
-            "score": 1.0,
-            "section": law_title,
-            "metadata": {"type": "law", "law_id": rec.get("law_id", "")},
-        })
-
-    return hits
-
-
-# ── Stage 7: Merge all hit sources, deduplicating by ID ──────────────────────
-
-def _merge_all_hits(
-    exact_hits: list[dict],
-    vector_hits: list[dict],
-    bm25_hits: list[dict],
-    corpus_bm25_hits: list[dict],
-    graph_hits: list[dict],
-) -> tuple[list[dict], set[str]]:
-    """Combine all hit sources into a single deduplicated list.
-
-    Graph hits bypass the cosine-score filter in stage 8 and are appended after
-    it, so they are returned separately in the second position.
-
-    Returns:
-        (qdrant_merged, seen_ids) — qdrant_merged contains exact+vector+bm25+corpus hits.
-        seen_ids is passed to stage 8 to avoid double-adding graph hits.
-    """
-    seen_ids: set[str] = set()
-    merged: list[dict] = []
-
-    for idx, hit in enumerate(exact_hits + vector_hits + bm25_hits + corpus_bm25_hits):
-        raw_id = hit.get("id")
-        hit_id = str(raw_id) if raw_id else f"idx:{idx}:{hash(hit.get('content', ''))}"
-        if hit_id not in seen_ids:
-            seen_ids.add(hit_id)
-            merged.append(hit)
-
-    # Graph hits added after deduplication pass so seen_ids stays accurate
-    for hit in graph_hits:
-        raw_id = hit.get("id")
-        hit_id = str(raw_id) if raw_id else f"graph:{hash(hit.get('content', ''))}"
-        if hit_id not in seen_ids:
-            seen_ids.add(hit_id)
-            merged.append(hit)
-
-    return merged, seen_ids
-
-
-# ── Stage 8: Relevance filtering ─────────────────────────────────────────────
-
-def _filter_by_relevance(hits: list[dict], s: Settings) -> list[dict]:
-    """Drop hits below min_relevance_score. Falls back to all if everything is filtered."""
-    filtered = [h for h in hits if h.get("score", 0) >= s.min_relevance_score]
-    if not filtered and hits:
-        logger.warning(
-            "search: all %d hits below min_relevance_score=%.2f — using all",
-            len(hits), s.min_relevance_score,
-        )
-        return hits
-    return filtered
-
-
-# ── Stage 9: Cross-encoder reranking + confidence calibration ────────────────
-
-def _rerank_and_calibrate(
-    query: str, candidates: list[dict], s: Settings
-) -> tuple[list[dict], float, bool]:
-    """Rerank with cross-encoder and decide whether context is usable.
-
-    Returns:
-        (reranked, best_score, has_context)
-    """
-    top_candidates = sorted(
-        candidates, key=lambda d: float(d.get("score", 0)), reverse=True
-    )[:s.rerank_candidate_pool]
-
-    reranked = (
-        reranker.invoke({"query": query, "documents": top_candidates, "top_k": s.rerank_top_k})
-        if top_candidates else []
-    )
-
-    best_score = reranked[0].get("rerank_score", 0.0) if reranked else 0.0
-    has_context = bool(reranked) and best_score >= s.search_min_confidence
-    return reranked, best_score, has_context
-
-
-# ── Stage 10: LLM prompt assembly ────────────────────────────────────────────
+# ── Stage 4: LLM prompt assembly ────────────────────────────────────────────
 
 def _build_llm_prompt(
     query: str,
@@ -508,20 +156,13 @@ def _build_llm_prompt(
     best_score: float,
     s: Settings,
 ) -> str:
-    """Build the user message for the LLM based on retrieval results."""
-
     def _ctx_block(i: int, d: dict) -> str:
-        """Build a single numbered context block with source header + content."""
         filename = extract_hit_filename(d) or "—"
         page = extract_hit_page(d)
         page_suffix = f", стр. {page}" if page else ""
-        # Exact hits get slightly more content (they were matched literally)
         limit = 1200 if str(d.get("id", "")) in exact_hit_ids else s.content_snippet_max_len
         content = d.get("content", "")[:limit]
-        return (
-            f"[Источник {i + 1}] Документ: {filename}{page_suffix}\n"
-            f"{content}"
-        )
+        return f"[Источник {i + 1}] Документ: {filename}{page_suffix}\n{content}"
 
     if is_exact and exact_hits:
         exact_blocks = "\n\n".join(
@@ -544,7 +185,6 @@ def _build_llm_prompt(
         context = "\n\n".join(_ctx_block(i, d) for i, d in enumerate(reranked))
         return f"Контекст:\n{context}\n\nВопрос: {query}"
 
-    # Low-confidence path — honest "not found" rather than hallucination
     logger.warning(
         "search: low confidence (best_score=%.3f, docs=%d) for query=%r",
         best_score, len(reranked), query,
@@ -557,10 +197,9 @@ def _build_llm_prompt(
     )
 
 
-# ── Stage 11: LLM answer generation ──────────────────────────────────────────
+# ── Stage 5: LLM answer generation ──────────────────────────────────────────
 
 def _generate_answer(user_msg: str, state: AgentState, s: Settings) -> str:
-    """Call the LLM with system prompt + conversation history + retrieval context."""
     llm = get_llm()
     history = build_history_messages(state, max_turns=s.history_turns)
     return invoke_with_retry(llm, [
@@ -570,12 +209,11 @@ def _generate_answer(user_msg: str, state: AgentState, s: Settings) -> str:
     ])
 
 
-# ── Stage 12: Citation builder ────────────────────────────────────────────────
+# ── Stage 6: Citation builder ───────────────────────────────────────────────
 
 def _build_citations(
-    reranked: list[dict], exact_hit_ids: set[str], s: Settings
+    reranked: list[dict], exact_hit_ids: set[str], s: Settings,
 ) -> list[dict]:
-    """Format the reranked documents into structured citation records."""
     return [
         {
             "index": i + 1,
@@ -592,50 +230,47 @@ def _build_citations(
     ]
 
 
-# ── Graph entry point ─────────────────────────────────────────────────────────
+# ── Graph entry point ───────────────────────────────────────────────────────
 
 def search_node(state: AgentState) -> AgentState:
-    """Hybrid RAG pipeline node: vector + BM25 + graph → rerank → generate → cite."""
+    """Hybrid RAG pipeline node: unified retrieval → generate → cite."""
     t_start = time.perf_counter()
     s = get_settings()
     query = state["user_query"]
 
     # 1. Prepare query
-    lexical_query, embed_query = _prepare_query(query, state)
+    query = _prepare_query(query, state)
 
     # 2-3. Exact-string search (when requested)
-    is_exact, exact_text = _detect_exact_search(lexical_query)
+    is_exact, exact_text = _detect_exact_search(query)
     exact_hits = _retrieve_exact(exact_text, s) if is_exact else []
     exact_hit_ids = {str(h.get("id")) for h in exact_hits if h.get("id")}
 
-    # 4. Vector + BM25 (inline rerank) + full-corpus BM25
-    vector_hits, bm25_hits, corpus_hits = _retrieve_vector_bm25(embed_query, lexical_query, s)
+    # 4. Unified retrieval (scope-aware)
+    scope = state.get("scope", "point")
+    doc_ids = state.get("document_ids") or []
+    doc_id = doc_ids[0] if doc_ids else None
 
-    # 5-6. Graph enrichment + normalization
-    graph_results = _retrieve_graph(lexical_query, s)
-    graph_hits = _normalize_graph_hits(graph_results, s)
+    result = retrieve(
+        query=query,
+        scope=scope,
+        doc_id=doc_id,
+    )
 
-    # 7. Merge all sources
-    merged, _ = _merge_all_hits(exact_hits, vector_hits, bm25_hits, corpus_hits, graph_hits)
+    reranked = result.chunks
+    best_score = result.best_score
+    has_context = result.has_context
 
-    # 8. Relevance filter
-    relevant = _filter_by_relevance(merged, s)
-
-    # 9. Rerank + confidence
-    reranked, best_score, has_context = _rerank_and_calibrate(lexical_query, relevant, s)
-
-    # 10-11. Prompt + answer
+    # 5. Prompt + answer
     user_msg = _build_llm_prompt(
-        lexical_query, is_exact, exact_text, exact_hits, exact_hit_ids,
+        query, is_exact, exact_text, exact_hits, exact_hit_ids,
         reranked, has_context, best_score, s,
     )
     answer = _generate_answer(user_msg, state, s)
 
     # Hallucination guard: retry once if LLM stubs despite having context
     if has_context and answer.strip() and _HALLUCINATION_STUBS.search(answer):
-        logger.warning(
-            "search_node: hallucination stub detected with has_context=True, retrying"
-        )
+        logger.warning("search_node: hallucination stub detected, retrying")
         retry_prompt = (
             f"{user_msg}\n\n"
             "ВАЖНО: Ответь на основе предоставленного контекста. "
@@ -643,15 +278,13 @@ def search_node(state: AgentState) -> AgentState:
         )
         answer = _generate_answer(retry_prompt, state, s)
 
-    # Empty answer guard: Ollama may be down (invoke_with_retry returns "")
     if not answer.strip():
-        logger.error("search_node: LLM returned empty response (Ollama may be down)")
+        logger.error("search_node: LLM returned empty response")
         answer = _OLLAMA_UNAVAILABLE_MSG
 
-    # 12. Citations
+    # 6. Citations
     citations = _build_citations(reranked, exact_hit_ids, s)
 
-    # Multi-intent: prepend prior agents' responses
     final_response = build_final_response(answer, state.get("combined_responses") or [])
 
     elapsed = time.perf_counter() - t_start
@@ -659,17 +292,10 @@ def search_node(state: AgentState) -> AgentState:
         "node": "search",
         "intent": state.get("intent", ""),
         "tier": state.get("tier", ""),
-        "query_len": len(lexical_query),
-        "vector_hits": len(vector_hits),
-        "bm25_hits": len(bm25_hits),
-        "corpus_bm25_hits": len(corpus_hits),
-        "graph_hits": len(graph_hits),
-        "entity_hits": len(graph_results.get("entities", [])),
-        "law_hits": len(graph_results.get("laws", [])),
-        "merged_hits": len(merged),
-        "relevant_hits": len(relevant),
+        "scope": scope,
+        "query_len": len(query),
+        **result.metrics,
         "reranked_hits": len(reranked),
-        "vector_score_stats": _score_stats([h.get("score", 0) for h in vector_hits]),
         "rerank_score_stats": _score_stats([h.get("rerank_score", 0) for h in reranked]),
         "best_rerank_score": round(best_score, 4),
         "has_context": has_context,
@@ -682,9 +308,6 @@ def search_node(state: AgentState) -> AgentState:
 
     return {
         **state,
-        "vector_hits": vector_hits,
-        "bm25_hits": bm25_hits,
-        "graph_hits": graph_hits,
         "reranked_docs": reranked,
         "search_result": answer,
         "citations": citations,

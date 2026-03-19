@@ -22,14 +22,43 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..core.config import get_settings
 from ..core.llm import get_draft_llm, invoke_with_retry
-from ..core.utils import strip_conversational_prefix
-from ..graph.state import AgentState
+from ..core.utils import DOC_REF_RE, strip_conversational_prefix
+from ..graph.state import AgentState, Scope
 from ..prompts import SUPERVISOR_CLASSIFY
 
 logger = logging.getLogger(__name__)
 
 Intent = Literal["ingest", "search", "verify", "generate", "analyze"]
 _VALID_INTENTS = {"ingest", "search", "verify", "generate", "analyze"}
+
+# ── Scope detection ──────────────────────────────────────────────────────────
+# Keywords that signal the user wants to process the ENTIRE document
+_FULL_DOC_KEYWORDS = re.compile(
+    r"\b(весь\s+документ|целиком|полностью|резюмируй|суммаризуй|суммарно|"
+    r"краткое\s+содержание|общий\s+анализ|полный\s+анализ|"
+    r"проверь\s+весь|проверь\s+целиком|проверить\s+весь|"
+    r"извлеки\s+все|извлечь\s+все|перечисли\s+все)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _detect_scope(query: str, doc_ids: list[str]) -> Scope:
+    """Determine retrieval scope from query + available document IDs.
+
+    Resolution order:
+      1. DOCUMENT — doc_ids present AND full-document keywords detected
+      2. SCOPED  — doc_ids present OR referential phrase ("этот документ")
+      3. POINT   — everything else (general question across collection)
+    """
+    has_doc = bool(doc_ids)
+    has_ref = bool(DOC_REF_RE.search(query))
+    wants_full = bool(_FULL_DOC_KEYWORDS.search(query))
+
+    if (has_doc or has_ref) and wants_full:
+        return "document"
+    if has_doc or has_ref:
+        return "scoped"
+    return "point"
 
 # ── Compound patterns (multi-intent, checked BEFORE single-intent) ────────────
 # Format: (compiled_regex, primary_intent, secondary_intent)
@@ -164,25 +193,31 @@ def classify_intent(state: AgentState) -> AgentState:
     query = strip_conversational_prefix(raw_query)
     q_lower = query.lower()
 
+    # 0. Detect retrieval scope (runs before intent classification)
+    doc_ids: list[str] = state.get("document_ids") or []
+    scope: Scope = _detect_scope(query, doc_ids)
+
     # 1. Compound patterns — checked before single-intent so "найди и проверь"
     #    is not incorrectly collapsed to a single intent.
     for pattern, primary, secondary in _COMPOUND_PATTERNS:
         if pattern.search(q_lower):
             elapsed = time.perf_counter() - t_start
             logger.info(
-                "supervisor: tier=compound intent=%s secondary=%s query=%r",
-                primary, secondary, query[:60],
+                "supervisor: tier=compound intent=%s secondary=%s scope=%s query=%r",
+                primary, secondary, scope, query[:60],
             )
             return {
                 **state,
                 "intent": primary,
                 "intents": [primary, secondary],
                 "tier": "compound",
+                "scope": scope,
                 "combined_responses": state.get("combined_responses") or [],
                 "retrieval_metrics": {
                     "node": "supervisor",
                     "intent": primary,
                     "tier": "compound",
+                    "scope": scope,
                     "elapsed_s": round(elapsed, 2),
                 },
             }
@@ -191,17 +226,19 @@ def classify_intent(state: AgentState) -> AgentState:
     kw_intent = _keyword_classify(query)
     if kw_intent:
         elapsed = time.perf_counter() - t_start
-        logger.info("supervisor: tier=keyword intent=%s query=%r", kw_intent, query[:60])
+        logger.info("supervisor: tier=keyword intent=%s scope=%s query=%r", kw_intent, scope, query[:60])
         return {
             **state,
             "intent": kw_intent,
             "intents": [kw_intent],
             "tier": "keyword",
+            "scope": scope,
             "combined_responses": state.get("combined_responses") or [],
             "retrieval_metrics": {
                 "node": "supervisor",
                 "intent": kw_intent,
                 "tier": "keyword",
+                "scope": scope,
                 "elapsed_s": round(elapsed, 2),
             },
         }
@@ -220,17 +257,19 @@ def classify_intent(state: AgentState) -> AgentState:
     intent: Intent = intents[0]  # type: ignore[assignment]
     elapsed = time.perf_counter() - t_start
 
-    logger.info("supervisor: tier=llm intent=%s query=%r raw=%r", intent, query[:60], raw[:40])
+    logger.info("supervisor: tier=llm intent=%s scope=%s query=%r raw=%r", intent, scope, query[:60], raw[:40])
     return {
         **state,
         "intent": intent,
         "intents": intents,
         "tier": "llm",
+        "scope": scope,
         "combined_responses": state.get("combined_responses") or [],
         "retrieval_metrics": {
             "node": "supervisor",
             "intent": intent,
             "tier": "llm",
+            "scope": scope,
             "elapsed_s": round(elapsed, 2),
         },
     }

@@ -95,8 +95,13 @@ class _CorpusBM25Index:
     def search(self, query: str, top_k: int, loader: Any) -> list[dict[str, Any]]:
         with self._lock:
             if self._stale() or not self._corpus:
-                chunks = loader()
+                try:
+                    chunks = loader()
+                except Exception as exc:
+                    logger.error("CorpusBM25: failed to load corpus: %s", exc)
+                    return []
                 if not chunks:
+                    logger.debug("CorpusBM25: corpus is empty (0 chunks loaded)")
                     return []
                 self._rebuild(chunks)
             if not self._bm25:

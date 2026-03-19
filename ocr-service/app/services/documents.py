@@ -22,10 +22,21 @@ def _encode_cursor(created_at: datetime, doc_id: uuid.UUID) -> str:
     return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
 
+class InvalidCursorError(ValueError):
+    """Raised when a pagination cursor string is malformed or tampered with."""
+
+
 def _decode_cursor(cursor: str) -> tuple[datetime, uuid.UUID]:
-    """Decode cursor string back into (created_at, id) pair."""
-    payload = json.loads(base64.urlsafe_b64decode(cursor.encode()))
-    return datetime.fromisoformat(payload["ts"]), uuid.UUID(payload["id"])
+    """Decode cursor string back into (created_at, id) pair.
+
+    Raises ``InvalidCursorError`` on any decoding failure.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode())
+        payload = json.loads(raw)
+        return datetime.fromisoformat(payload["ts"]), uuid.UUID(payload["id"])
+    except (ValueError, KeyError, json.JSONDecodeError, Exception) as exc:
+        raise InvalidCursorError(f"Malformed cursor: {exc}") from exc
 
 
 class DocumentService:
@@ -176,3 +187,16 @@ class DocumentService:
         )
         await self.session.flush()
         logger.info(f"Document {doc_id} → {status.value}")
+
+    async def delete_document(self, doc_id: uuid.UUID) -> Document | None:
+        """Delete a document by ID. Returns the deleted document or None if not found.
+
+        Does NOT delete MinIO objects — caller is responsible for storage cleanup.
+        """
+        doc = await self.find_by_id(doc_id)
+        if doc is None:
+            return None
+        await self.session.delete(doc)
+        await self.session.flush()
+        logger.info(f"Deleted document {doc_id} ({doc.filename})")
+        return doc

@@ -1,17 +1,44 @@
 """LangGraph shared state definition."""
 from __future__ import annotations
 
-from typing import Annotated, Any
+from dataclasses import dataclass, field
+from typing import Annotated, Any, Literal
 from typing_extensions import TypedDict
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
 
+# ── Retrieval scope literals ─────────────────────────────────────────────────
+# point   — search across the entire collection (current default behaviour)
+# scoped  — search within a single document identified by doc_id
+# document — process the entire document via Map-Reduce
+Scope = Literal["point", "scoped", "document"]
+
+
+# ── Unified retrieval result ─────────────────────────────────────────────────
+
+@dataclass
+class RetrievalResult:
+    """Return type for the unified retrieval module.
+
+    Every retrieval strategy (point / scoped / document) returns this,
+    so consuming agents don't care *how* chunks were fetched.
+    """
+
+    chunks: list[dict[str, Any]] = field(default_factory=list)
+    best_score: float = 0.0
+    has_context: bool = False
+    scope: Scope = "point"
+    total_doc_chunks: int = 0  # how many chunks the document has (scoped/document)
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+
 class RetrievalMetrics(TypedDict, total=False):
     """Structured observability payload set by retrieval nodes."""
     node: str                  # which agent produced these metrics
     elapsed_s: float           # wall-clock seconds for the node
+    scope: str                 # point | scoped | document
     merged_hits: int           # total chunks after vector+BM25 merge
     graph_hits: int            # chunks added from Neo4j
     best_rerank_score: float   # top cross-encoder sigmoid score
@@ -39,6 +66,8 @@ class AgentState(TypedDict):
     tier: str
     # document IDs the user mentioned / uploaded
     document_ids: list[str]
+    # Retrieval scope determined by supervisor: point | scoped | document
+    scope: Scope
 
     # ── Retrieved context ─────────────────────────────────────────────
     vector_hits: list[dict[str, Any]]    # from Qdrant

@@ -1,24 +1,30 @@
 """Analyze Agent — Q&A, comparison, extraction, and summarisation.
 
+Refactored to use the unified retrieval module.
+
 Pipeline (per request):
   1. strip_conversational_prefix — remove greeting noise before retrieval
   2. _detect_task                — classify into qa / compare / extract / summary
   3. _enrich_search_query        — expand "этот документ" refs to real filenames
-  4. _retrieve_and_rerank        — vector → BM25 → graph sections → cross-encoder
+  4. retrieve()                  — unified retrieval (point / scoped / document)
   5. _build_context_string       — assemble LLM-ready context with source headers
   6. _run_analysis_llm           — task-specific prompt + LLM call
-     · compare / extract → JSON  (parse_with_retry + Pydantic schema, num_predict=2000)
-     · qa / summary      → text  (get_llm, num_predict=2000)
   7. _parse_result               — validated dict for JSON tasks; pass-through text
   8. _format_output              — readable markdown with human-friendly headers
   9. _build_citations            — filename + page + rerank_score per hit
  10. analyze_node                — orchestrator; returns updated AgentState
+
+Key changes:
+  - Uses unified ``retrieve()`` instead of inline retrieval pipeline.
+  - SCOPED mode for document-specific queries (top-20 from correct document).
+  - DOCUMENT mode for summary/extract — Map-Reduce over all chunks.
+  - Compare uses two SCOPED retrievals when doc_ids available.
+  - Same retrieval quality as search_agent (corpus BM25 + full Neo4j in point mode).
 """
 from __future__ import annotations
 
 import logging
 import re
-import statistics as _statistics
 import time
 from typing import Literal
 
@@ -43,32 +49,17 @@ from ..prompts import (
     ANALYZE_QA,
     ANALYZE_SUMMARY,
 )
-from ..tools.bm25_search import bm25_search
-from ..tools.neo4j_query import graph_section_search
-from ..tools.qdrant_search import qdrant_search
-from ..tools.reranker import reranker
+from ..tools.retrieval import retrieve
 
 logger = logging.getLogger(__name__)
 
-# ── Graceful degradation message when Ollama is unreachable ──────────────────
 _OLLAMA_UNAVAILABLE_MSG = (
     "К сожалению, языковая модель временно недоступна. "
     "Попробуйте повторить запрос через несколько минут."
 )
 
 
-def _score_stats(scores: list[float]) -> dict:
-    """Return min/max/p50 for a list of scores. Returns empty dict if no scores."""
-    if not scores:
-        return {}
-    return {
-        "min": round(min(scores), 4),
-        "max": round(max(scores), 4),
-        "p50": round(_statistics.median(scores), 4),
-    }
-
-
-# ── Task classification ────────────────────────────────────────────────────────
+# ── Task classification ──────────────────────────────────────────────────────
 
 TaskType = Literal["qa", "compare", "extract", "summary"]
 
@@ -85,7 +76,6 @@ _SUMMARY_STEMS = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
-# Friendly display names for each task type used in _format_output headers.
 _TASK_LABELS: dict[TaskType, str] = {
     "qa": "Ответ",
     "compare": "Сравнительный анализ",
@@ -93,18 +83,13 @@ _TASK_LABELS: dict[TaskType, str] = {
     "summary": "Резюме документа",
 }
 
-# Regex that extracts the two subjects of a compare query.
-# Handles patterns like "сравни X и Y", "сравни X с Y", "отличие X от Y".
 _COMPARE_PAIR_RE = re.compile(
     r"(?:сравн\w*|сопостав\w*|отличи[ея]\s+\w+\s+от)\s+(.+?)\s+(?:и|с|vs\.?)\s+(.+?)$",
     re.IGNORECASE | re.UNICODE,
 )
 
 
-# ── Stage 1 + 2: Task classification ──────────────────────────────────────────
-
 def _detect_task(query: str) -> TaskType:
-    """Return the analysis task type inferred from the user query."""
     q = query.lower()
     if _COMPARE_STEMS.search(q):
         return "compare"
@@ -115,14 +100,9 @@ def _detect_task(query: str) -> TaskType:
     return "qa"
 
 
-# ── Stage 3: Referential enrichment ──────────────────────────────────────────
+# ── Referential enrichment ───────────────────────────────────────────────────
 
 def _enrich_search_query(query: str, state: AgentState) -> tuple[str, str | None]:
-    """Expand referential phrases like 'этот документ' with the actual filename.
-
-    Returns:
-        (search_query, recent_filename)
-    """
     if DOC_REF_RE.search(query):
         filename = extract_recent_filename(state)
         if filename:
@@ -131,157 +111,23 @@ def _enrich_search_query(query: str, state: AgentState) -> tuple[str, str | None
     return query, None
 
 
-# ── Stage 4a: Retrieve + rerank (single context) ──────────────────────────────
-
-def _retrieve_and_rerank(
-    search_query: str,
-    lexical_query: str,
-    limit: int,
-    s: Settings,
-) -> tuple[list[dict], float, bool, dict]:
-    """Hybrid retrieval pipeline for analyze: vector → BM25 → graph → rerank.
-
-    Unlike the search agent this is deliberately synchronous (no thread pool)
-    because analyze tasks are already heavier LLM operations; the graph
-    enrichment adds minimal extra latency compared to the total task time.
-
-    Returns:
-        (reranked_docs, best_rerank_score, has_usable_context, stage_counts)
-    """
-    # 1. Vector search — broad semantic recall
-    vector_hits: list[dict] = qdrant_search.invoke({
-        "query": search_query,
-        "limit": limit,
-    })
-
-    if not vector_hits:
-        return [], 0.0, False, {"vector_hits": 0, "bm25_hits": 0, "graph_hits": 0, "merged_hits": 0, "reranked_hits": 0, "rerank_score_stats": {}}
-
-    # 2. BM25 over vector results — lifts lexically strong hits
-    bm25_hits: list[dict] = bm25_search.invoke({
-        "query": lexical_query,
-        "documents": vector_hits,
-        "top_k": limit,
-    })
-
-    # 3. Neo4j section enrichment — structured law/section text
-    graph_hits: list[dict] = []
-    try:
-        kw = " ".join(
-            w for w in re.findall(r"[а-яёА-ЯЁa-zA-Z0-9]+", lexical_query)
-            if len(w) >= 3
-        )[:80]
-        sections = graph_section_search.invoke({"keywords": kw, "limit": 3})
-        for sec in sections:
-            text = (sec.get("text") or "")[:s.content_snippet_max_len]
-            if text:
-                graph_hits.append({
-                    "id": sec.get("section_id") or f"sec:{hash(text)}",
-                    "content": text,
-                    "score": float(sec.get("score", 0.5)),
-                    "section": f"стр. {sec.get('page', '?')} — {sec.get('source', '')}",
-                    "metadata": {
-                        "source": sec.get("source", ""),
-                        "page": sec.get("page"),
-                    },
-                })
-    except Exception as exc:
-        logger.warning("analyze: graph section search failed: %s", exc)
-
-    # 4. Merge BM25 + graph, dedup by ID
-    seen_ids: set[str] = set()
-    merged: list[dict] = []
-    for hit in bm25_hits + graph_hits:
-        hit_id = str(hit.get("id") or "")
-        if hit_id and hit_id in seen_ids:
-            continue
-        if hit_id:
-            seen_ids.add(hit_id)
-        merged.append(hit)
-
-    # 4b. Cosine pre-filter (mirrors search_agent _filter_by_relevance)
-    filtered = [h for h in merged if h.get("score", 0) >= s.min_relevance_score]
-    if not filtered and merged:
-        logger.warning(
-            "analyze: all %d hits below min_relevance_score=%.2f -- using all",
-            len(merged), s.min_relevance_score,
-        )
-        filtered = merged
-    merged = filtered
-
-    # 5. Cross-encoder rerank over candidate pool
-    candidates = sorted(
-        merged, key=lambda d: float(d.get("score", 0)), reverse=True
-    )[:s.rerank_candidate_pool]
-
-    reranked: list[dict] = (
-        reranker.invoke({
-            "query": lexical_query,
-            "documents": candidates,
-            "top_k": s.rerank_top_k,
-        })
-        if candidates else []
-    )
-
-    best_score = reranked[0].get("rerank_score", 0.0) if reranked else 0.0
-    has_context = bool(reranked) and best_score >= s.search_min_confidence
-
-    logger.info(
-        "analyze: retrieve_and_rerank hits=%d→bm25=%d→graph=%d→merged=%d "
-        "→reranked=%d  best_score=%.3f",
-        len(vector_hits), len(bm25_hits), len(graph_hits),
-        len(merged), len(reranked), best_score,
-    )
-    stage_counts = {
-        "vector_hits": len(vector_hits),
-        "bm25_hits": len(bm25_hits),
-        "graph_hits": len(graph_hits),
-        "merged_hits": len(merged),
-        "reranked_hits": len(reranked),
-        "rerank_score_stats": _score_stats([h.get("rerank_score", 0) for h in reranked]),
-    }
-    return reranked, best_score, has_context, stage_counts
-
-
-# ── Stage 4b: Compare — fetch two independent contexts ────────────────────────
-
 def _extract_compare_subjects(query: str) -> tuple[str, str] | None:
-    """Try to extract the two subjects of a compare query.
-
-    Handles patterns like:
-    - "сравни закон о банках и закон о финансировании"
-    - "отличие залога от поручительства"
-    - "сравни главу 2 с главой 3"
-
-    Returns (subject_a, subject_b) or None if extraction fails.
-    """
     m = _COMPARE_PAIR_RE.search(query)
     if m:
         a = m.group(1).strip()
         b = m.group(2).strip()
-        # Sanity-check: each subject should be at least 2 characters
         if len(a) >= 2 and len(b) >= 2:
             return a, b
     return None
 
 
-
-# ── Stage 5: Context string assembly ──────────────────────────────────────────
+# ── Context string assembly ──────────────────────────────────────────────────
 
 def _build_context_string(
     hits: list[dict],
     label: str = "Контекст",
     s: Settings | None = None,
 ) -> str:
-    """Build a numbered context string with source headers for the LLM.
-
-    Each block starts with:
-        [Источник N] Документ: <filename>, стр. <page>
-        <content>
-
-    This mirrors the search agent format so ANALYZE_QA can use the same
-    source-citation convention.
-    """
     if s is None:
         s = get_settings()
     parts: list[str] = []
@@ -302,7 +148,6 @@ def _build_compare_context(
     subjects: tuple[str, str] | None,
     s: Settings,
 ) -> str:
-    """Build a two-sided context block for compare tasks."""
     label_a = f"Документ А ({subjects[0]})" if subjects else "Документ А"
     label_b = f"Документ Б ({subjects[1]})" if subjects else "Документ Б"
     ctx_a = _build_context_string(hits_a, label=label_a, s=s)
@@ -310,7 +155,7 @@ def _build_compare_context(
     return f"{ctx_a}\n\n{'─' * 60}\n\n{ctx_b}"
 
 
-# ── Stage 6: LLM call ──────────────────────────────────────────────────────────
+# ── LLM call ─────────────────────────────────────────────────────────────────
 
 _NO_CONTEXT_RESPONSE = (
     "В загруженных документах не найдено достаточно релевантной информации "
@@ -325,7 +170,6 @@ _TASK_SYSTEM_PROMPTS: dict[TaskType, str] = {
     "summary": ANALYZE_SUMMARY,
 }
 
-# Tasks that return structured JSON (others return free text)
 _JSON_TASKS: frozenset[TaskType] = frozenset({"compare", "extract"})
 
 _JSON_TASK_SCHEMAS: dict[str, type] = {
@@ -342,23 +186,9 @@ def _run_analysis_llm(
     state: AgentState,
     s: Settings,
 ) -> tuple[str | dict, bool]:
-    """Call the LLM with the appropriate task prompt.
-
-    For JSON tasks (compare, extract): uses parse_with_retry with schema constraint.
-    For text tasks (qa, summary): uses get_llm, returns raw text.
-
-    Returns:
-        (raw_output_or_dict, json_success)
-        - JSON tasks: (dict from model_dump or raw str, success bool)
-        - Text tasks: (raw str, True) — no JSON parsing needed
-    """
     system_prompt = _TASK_SYSTEM_PROMPTS[task]
     doc_hint = f"\nАнализируемый документ: {recent_filename}\n" if recent_filename else ""
-    user_msg = (
-        f"Запрос: {query}\n{doc_hint}\n"
-        f"{context_str}"
-    )
-
+    user_msg = f"Запрос: {query}\n{doc_hint}\n{context_str}"
     history = build_history_messages(state, max_turns=s.history_turns)
 
     if task in _JSON_TASKS:
@@ -371,7 +201,6 @@ def _run_analysis_llm(
         result, success = parse_with_retry(messages, schema, num_predict=2000)
         if success and result is not None:
             return result.model_dump(), True
-        # Return raw empty string on total failure — _parse_result will create fallback
         return "", False
     else:
         llm = get_llm(num_predict=2000)
@@ -381,25 +210,17 @@ def _run_analysis_llm(
             HumanMessage(content=user_msg),
         ])
         if not raw.strip():
-            logger.error("analyze: LLM returned empty for task=%s (Ollama may be down)", task)
+            logger.error("analyze: LLM returned empty for task=%s", task)
             raw = _OLLAMA_UNAVAILABLE_MSG
         return raw, True
 
 
-# ── Stage 7: Result parsing ────────────────────────────────────────────────────
+# ── Result parsing ───────────────────────────────────────────────────────────
 
 def _parse_result(raw: str | dict, task: TaskType, query: str, json_success: bool = True) -> dict:
-    """Parse LLM output into a normalised dict.
-
-    JSON tasks: if json_success=True, raw is already a validated dict.
-    If json_success=False, build fallback dict with _parse_failed=True.
-    Text tasks: wrap raw text in {"task": task, "result": raw}.
-    """
     if task in _JSON_TASKS:
         if json_success and isinstance(raw, dict):
             return raw
-
-        # Parse failure fallback
         raw_str = raw if isinstance(raw, str) else ""
         return {
             "task": task,
@@ -413,8 +234,6 @@ def _parse_result(raw: str | dict, task: TaskType, query: str, json_success: boo
             "confidence": 0.5,
             "_parse_failed": True,
         }
-
-    # Free-text tasks: no JSON expected
     raw_str = raw if isinstance(raw, str) else str(raw)
     return {
         "task": task,
@@ -423,13 +242,9 @@ def _parse_result(raw: str | dict, task: TaskType, query: str, json_success: boo
     }
 
 
-# ── Stage 8: Output formatting ────────────────────────────────────────────────
+# ── Output formatting ───────────────────────────────────────────────────────
 
 def _format_output(result: dict, task: TaskType) -> str:
-    """Render the parsed result as human-readable markdown.
-
-    Uses friendly section headers, not technical task names.
-    """
     label = _TASK_LABELS.get(task, "Анализ")
     parts = [f"**{label}:**\n\n{result.get('result', '')}"]
 
@@ -473,10 +288,9 @@ def _format_output(result: dict, task: TaskType) -> str:
     return "\n\n".join(parts)
 
 
-# ── Stage 9: Citations ────────────────────────────────────────────────────────
+# ── Citations ────────────────────────────────────────────────────────────────
 
 def _build_citations(hits: list[dict], s: Settings) -> list[dict]:
-    """Build structured citation records from reranked hits."""
     return [
         {
             "index": i + 1,
@@ -490,15 +304,15 @@ def _build_citations(hits: list[dict], s: Settings) -> list[dict]:
     ]
 
 
-# ── Graph entry point ─────────────────────────────────────────────────────────
+# ── Graph entry point ───────────────────────────────────────────────────────
 
 def analyze_node(state: AgentState) -> AgentState:
-    """Analysis node: classify task → retrieve → rerank → LLM → format."""
+    """Analysis node: classify task → unified retrieve → LLM → format."""
     t_start = time.perf_counter()
     s = get_settings()
     raw_query = state["user_query"]
 
-    # 1. Strip greeting noise (same as search agent)
+    # 1. Strip greeting noise
     query = strip_conversational_prefix(raw_query)
 
     # 2. Detect task
@@ -507,60 +321,83 @@ def analyze_node(state: AgentState) -> AgentState:
     # 3. Referential enrichment
     search_query, recent_filename = _enrich_search_query(query, state)
 
-    # ── 4. Retrieve depending on task ────────────────────────────────────────
+    # Scope and doc_id from supervisor
+    scope = state.get("scope", "point")
+    doc_ids = state.get("document_ids") or []
+    doc_id = doc_ids[0] if doc_ids else None
+
+    # ── 4. Retrieve depending on task + scope ────────────────────────────────
     all_hits: list[dict] = []
     has_context = False
     best_score = 0.0
     context_str = ""
-    stage_counts: dict = {}
+    retrieval_metrics: dict = {}
 
     if task == "compare":
-        # Rerank each side independently so the cross-encoder sees the right query
+        # Compare: two independent retrievals
         subjects = _extract_compare_subjects(query)
         query_a = subjects[0] if subjects else query
         query_b = subjects[1] if subjects else query
-        reranked_a, score_a, ok_a, counts_a = _retrieve_and_rerank(query_a, query_a, s.analyze_compare_limit, s)
-        reranked_b, score_b, ok_b, counts_b = _retrieve_and_rerank(query_b, query_b, s.analyze_compare_limit, s)
 
-        logger.info(
-            "analyze: compare side_a hits=%d best_score=%.3f | side_b hits=%d best_score=%.3f",
-            len(reranked_a), score_a, len(reranked_b), score_b,
-        )
+        # Use scoped if doc_ids available, point otherwise.
+        # When only one doc_id: side_a = scoped (search within the document),
+        # side_b = point (search entire collection) to avoid comparing
+        # the same document against itself.
+        result_a = retrieve(query_a, scope=scope, doc_id=doc_id, top_k=15)
+        if len(doc_ids) > 1:
+            doc_id_b = doc_ids[1]
+            scope_b = scope
+        else:
+            doc_id_b = doc_id
+            scope_b = "point" if subjects else scope
+        result_b = retrieve(query_b, scope=scope_b, doc_id=doc_id_b, top_k=15)
 
-        has_context = ok_a or ok_b
-        best_score = max(score_a, score_b)
-        all_hits = reranked_a + reranked_b
+        has_context = result_a.has_context or result_b.has_context
+        best_score = max(result_a.best_score, result_b.best_score)
+        all_hits = result_a.chunks + result_b.chunks
+        context_str = _build_compare_context(result_a.chunks, result_b.chunks, subjects, s)
 
-        stage_counts = {
-            "vector_hits": counts_a.get("vector_hits", 0) + counts_b.get("vector_hits", 0),
-            "bm25_hits": counts_a.get("bm25_hits", 0) + counts_b.get("bm25_hits", 0),
-            "graph_hits": counts_a.get("graph_hits", 0) + counts_b.get("graph_hits", 0),
-            "merged_hits": counts_a.get("merged_hits", 0) + counts_b.get("merged_hits", 0),
-            "reranked_hits": counts_a.get("reranked_hits", 0) + counts_b.get("reranked_hits", 0),
-            "rerank_score_stats": _score_stats(
-                [h.get("rerank_score", 0) for h in reranked_a + reranked_b]
-            ),
+        retrieval_metrics = {
+            "side_a": result_a.metrics,
+            "side_b": result_b.metrics,
+            "scope": scope,
         }
 
-        context_str = _build_compare_context(reranked_a, reranked_b, subjects, s)
-
-    elif task == "summary":
-        # Summary needs broad coverage — use a larger hit limit
-        reranked, best_score, has_context, stage_counts = _retrieve_and_rerank(
-            search_query, query, s.analyze_summary_limit, s
+    elif task == "summary" and scope == "document" and doc_id:
+        # Map-Reduce summary over entire document
+        result = retrieve(
+            search_query, scope="document", doc_id=doc_id, task_type="summary",
         )
-        all_hits = reranked
-        context_str = _build_context_string(reranked, s=s)
+        all_hits = result.chunks
+        has_context = result.has_context
+        best_score = result.best_score
+        # Map-Reduce returns pre-processed content — use it directly
+        context_str = _build_context_string(result.chunks, s=s)
+        retrieval_metrics = result.metrics
+
+    elif task == "extract" and scope == "document" and doc_id:
+        # Map-Reduce extraction over entire document
+        result = retrieve(
+            search_query, scope="document", doc_id=doc_id, task_type="extract",
+        )
+        all_hits = result.chunks
+        has_context = result.has_context
+        best_score = result.best_score
+        context_str = _build_context_string(result.chunks, s=s)
+        retrieval_metrics = result.metrics
 
     else:
-        # qa / extract — standard retrieve
-        reranked, best_score, has_context, stage_counts = _retrieve_and_rerank(
-            search_query, query, s.rerank_top_k * 2, s
-        )
-        all_hits = reranked
-        context_str = _build_context_string(reranked, s=s)
+        # qa / extract / summary — standard retrieval (scoped or point)
+        # In scoped mode: top-20 from the correct document
+        # In point mode: top-7 from entire collection (same as search_agent)
+        result = retrieve(search_query, scope=scope, doc_id=doc_id)
+        all_hits = result.chunks
+        has_context = result.has_context
+        best_score = result.best_score
+        context_str = _build_context_string(result.chunks, s=s)
+        retrieval_metrics = result.metrics
 
-    # ── 5. No-context fallback — honest "not found" instead of hallucination ─
+    # ── 5. No-context fallback ───────────────────────────────────────────────
     if not has_context:
         logger.warning(
             "analyze_node: no usable context (best_score=%.3f, task=%s, query=%r)",
@@ -579,41 +416,35 @@ def analyze_node(state: AgentState) -> AgentState:
                 "node": "analyze",
                 "intent": state.get("intent", ""),
                 "tier": state.get("tier", ""),
+                "scope": scope,
                 "task": task,
-                "vector_hits": stage_counts.get("vector_hits", 0),
-                "bm25_hits": stage_counts.get("bm25_hits", 0),
-                "graph_hits": stage_counts.get("graph_hits", 0),
-                "merged_hits": stage_counts.get("merged_hits", 0),
-                "reranked_hits": stage_counts.get("reranked_hits", 0),
+                **retrieval_metrics,
                 "best_rerank_score": round(best_score, 4),
-                "rerank_score_stats": stage_counts.get("rerank_score_stats", {}),
                 "has_context": False,
-                "json_parse_success": None,
                 "elapsed_s": round(elapsed, 2),
             },
             "messages": state["messages"] + [AIMessage(content=final_response)],
         }
 
-    # ── 6. LLM call ──────────────────────────────────────────────────────────
+    # ── 6. LLM call ─────────────────────────────────────────────────────────
     raw, json_success = _run_analysis_llm(query, task, context_str, recent_filename, state, s)
 
-    # ── 7–8. Parse + format ───────────────────────────────────────────────────
+    # ── 7–8. Parse + format ──────────────────────────────────────────────────
     analyze_result = _parse_result(raw, task, query, json_success=json_success)
     summary = _format_output(analyze_result, task)
 
-    # ── 9. Citations ──────────────────────────────────────────────────────────
+    # ── 9. Citations ─────────────────────────────────────────────────────────
     citations = _build_citations(all_hits, s)
 
     final_response = build_final_response(summary, state.get("combined_responses") or [])
     elapsed = time.perf_counter() - t_start
 
     logger.info(
-        "analyze_node: task=%s hits=%d best_score=%.3f confidence=%.2f elapsed=%.2fs",
-        task, len(all_hits), best_score,
+        "analyze_node: task=%s scope=%s hits=%d best_score=%.3f confidence=%.2f elapsed=%.2fs",
+        task, scope, len(all_hits), best_score,
         analyze_result.get("confidence", 0.0), elapsed,
     )
 
-    # json_parse_success: only meaningful for JSON tasks (compare, extract)
     _json_parse_success: bool | None = None
     if task in _JSON_TASKS:
         _json_parse_success = not analyze_result.get("_parse_failed", False)
@@ -627,14 +458,10 @@ def analyze_node(state: AgentState) -> AgentState:
             "node": "analyze",
             "intent": state.get("intent", ""),
             "tier": state.get("tier", ""),
+            "scope": scope,
             "task": task,
-            "vector_hits": stage_counts.get("vector_hits", 0),
-            "bm25_hits": stage_counts.get("bm25_hits", 0),
-            "graph_hits": stage_counts.get("graph_hits", 0),
-            "merged_hits": stage_counts.get("merged_hits", 0),
-            "reranked_hits": stage_counts.get("reranked_hits", 0),
+            **retrieval_metrics,
             "best_rerank_score": round(best_score, 4),
-            "rerank_score_stats": stage_counts.get("rerank_score_stats", {}),
             "has_context": has_context,
             "json_parse_success": _json_parse_success,
             "elapsed_s": round(elapsed, 2),

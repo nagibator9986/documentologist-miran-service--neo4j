@@ -284,33 +284,35 @@ services:
     logging: *default-logging
 
   # Step 2: bank_knowledge Indexer — chunk → embed → Qdrant + Neo4j
+  # Runs in API mode: FastAPI webhook server on port 8002.
+  # OCR service POSTs to /api/v1/index after document processing.
   bank-knowledge:
     build:
       context: ./bank_knowledge
-      dockerfile: Dockerfile.indexer
+      dockerfile: Dockerfile
     container_name: miran-bank-knowledge
     restart: unless-stopped
     ports:
       - "127.0.0.1:8002:8002"
     environment:
+      MODE: "api"
       MINIO_ENDPOINT: "minio:9000"
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       MINIO_SECURE: "false"
-      BUCKET_RESULTS: "analysis-results"
       QDRANT_URL: "http://qdrant:6333"
       QDRANT_COLLECTION: ${QDRANT_COLLECTION:-bank_knowledge}
-      QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-1024}
+      VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-1024}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
-      OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-bge-m3:latest}
-      OLLAMA_CHAT_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b}
+      EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-bge-m3:latest}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
       NEO4J_URI: "bolt://neo4j:7687"
       NEO4J_USER: ${NEO4J_USER:-neo4j}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD}
-      REDIS_URL: "redis://redis:6379"
-      CHUNK_MAX_CHARS: ${CHUNK_MAX_CHARS:-2000}
-      CHUNK_OVERLAP_CHARS: ${CHUNK_OVERLAP_CHARS:-200}
-      CHUNK_MIN_CHARS: ${CHUNK_MIN_CHARS:-100}
+      OCR_CHUNK_SIZE_CHARS: ${CHUNK_MAX_CHARS:-1200}
+      OCR_CHUNK_OVERLAP_CHARS: ${CHUNK_OVERLAP_CHARS:-150}
+      OCR_MIN_CHUNK_CHARS: ${CHUNK_MIN_CHARS:-40}
+      APP_ENV: ${APP_ENV:-prod}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       qdrant:
@@ -319,8 +321,12 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       - miran-net
     logging: *default-logging
@@ -376,7 +382,7 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:3000"]}
 
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-mistral:latest}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
       OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-bge-m3:latest}
       OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-120}
 
@@ -413,7 +419,7 @@ services:
       postgres:
         condition: service_healthy
       bank-knowledge:
-        condition: service_started
+        condition: service_healthy
       ocr-api:
         condition: service_started
     healthcheck:

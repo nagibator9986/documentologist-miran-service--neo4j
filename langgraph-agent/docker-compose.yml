@@ -53,7 +53,7 @@ services:
       # Tuning
       MAX_TOKENS_RESPONSE: ${MAX_TOKENS_RESPONSE:-2048}
       TEMPERATURE: ${TEMPERATURE:-0.1}
-      MIN_RELEVANCE_SCORE: ${MIN_RELEVANCE_SCORE:-0.5}
+      MIN_RELEVANCE_SCORE: ${MIN_RELEVANCE_SCORE:-0.25}
 
       # MLflow observability (enabled by default — set MLFLOW_ENABLED=false to disable)
       MLFLOW_ENABLED: ${MLFLOW_ENABLED:-true}
