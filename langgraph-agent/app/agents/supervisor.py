@@ -127,18 +127,15 @@ _SEARCH_KW = re.compile(
 def _keyword_classify(query: str) -> str | None:
     """Return a high-confidence single intent from keywords, or None if ambiguous.
 
-    Ordering is intentional — see module docstring for rationale.
+    Only ingest and generate are in keyword tier — they are unambiguous actions.
+    verify, analyze, search require LLM because they are semantically similar:
+    - "Является ли исламский банк...?" looks like verify but is search (factual question)
+    - verify ONLY applies when user provides their own document/text to check
     """
     if _INGEST_KW.search(query):
         return "ingest"
-    if _ANALYZE_KW.search(query):
-        return "analyze"
     if _GENERATE_KW.search(query):
         return "generate"
-    if _VERIFY_KW.search(query):
-        return "verify"
-    if _SEARCH_KW.search(query):
-        return "search"
     return None
 
 

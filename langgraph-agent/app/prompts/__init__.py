@@ -6,20 +6,31 @@ Each constant is named AGENT_PURPOSE to make the origin unambiguous.
 
 # ── Supervisor ────────────────────────────────────────────────────────────────
 
-SUPERVISOR_CLASSIFY = """Classify the user request into EXACTLY one of these intents (output the single English word only):
+SUPERVISOR_CLASSIFY = """Classify the user request into EXACTLY one intent (output the single English word only).
 
-search   - find information, answer questions, retrieve documents
-           Examples: "что такое", "расскажи про", "найди", "какие права", "как работает", "объясни"
-analyze  - compare documents/articles, summarize, extract entities
-           Examples: "сравни", "отличие между", "разница", "резюмируй", "извлеки", "перечисли сущности"
-verify   - check compliance, find violations, assess legal risk
-           Examples: "проверь на соответствие", "есть ли нарушения", "оцени риски"
-generate - create a new document (contract, report, letter)
-           Examples: "составь договор", "создай отчёт", "напиши письмо", "сгенерируй"
-ingest   - upload document, check processing status, manage indexed files
-           Examples: "загрузи документ", "статус обработки", "добавь файл", "проиндексируй", "какие документы загружены"
+CRITICAL RULE — verify vs search:
+  verify = user provides their OWN document/contract/clause text and asks to check it for compliance.
+           The user's text is embedded in the query or they say "проверь этот договор / данный пункт / следующий текст".
+  search = user asks a FACTUAL QUESTION about what the law says. No user document provided.
+           Even if the question contains "является ли", "соответствует ли", "вправе ли", "несёт ли" —
+           if there is NO user-provided text to check, it is ALWAYS search.
 
-If TWO different operations are needed, output both separated by comma, e.g.: search,verify
+Intents:
+  search   — factual question, information lookup, legal norm retrieval
+             Examples: "что такое депозит", "является ли исламский банк участником гарантирования",
+                       "несёт ли банк-нерезидент ответственность", "какой процент акций",
+                       "какие ограничения для лиц с судимостью", "сколько уровней банковской системы"
+  analyze  — compare two documents, summarize, extract entities from a document
+             Examples: "сравни договоры", "резюмируй документ", "извлеки сущности", "перечисли виды"
+  verify   — user provides their own text/clause/contract for compliance check
+             Examples: "проверь этот договор: [текст]", "вот пункт договора — есть ли нарушения: [текст]",
+                       "проверь на соответствие следующее условие: [текст]"
+  generate — create a new document (contract, report, letter)
+             Examples: "составь договор", "создай отчёт", "напиши письмо"
+  ingest   — upload, index, check processing status of files
+             Examples: "загрузи документ", "статус обработки", "какие документы загружены"
+
+If TWO operations are needed, output both separated by comma: search,verify
 
 Output ONLY the intent word(s), nothing else."""
 
